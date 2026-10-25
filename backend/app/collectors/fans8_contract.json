@@ -191,6 +191,60 @@
         "info": "登录状态失效,重新登录!!",
         "count": 0
       }
+    },
+    {
+      "id": "E15",
+      "source": "https://fans8.top/api/goodsList",
+      "kind": "authenticated_read_only_contract_check",
+      "observed_at": "2026-10-25T15:53:11.895705+00:00",
+      "query": {
+        "Page": 1,
+        "PageCount": 5000,
+        "Sort": 1,
+        "AdminId": 1
+      },
+      "rows": 4881,
+      "unique_ids": 4881,
+      "declared_total": 4881,
+      "duration_seconds": 28.156,
+      "meaning": "The endpoint supports a single complete response for this live catalogue. Cross-page count and duplicate guards remain required above the page limit."
+    },
+    {
+      "id": "E16",
+      "source": "https://fans8.top/api/userInfo?Switch=4",
+      "kind": "isolated_guest_read_only_contract_check",
+      "observed_at": "2026-10-25T15:43:01Z",
+      "identity": {
+        "Id": 0,
+        "Level": 1
+      },
+      "goods_count": 4882,
+      "samples": {
+        "4344": "0.09405",
+        "7350": "0.03718",
+        "7331": "0.00157"
+      },
+      "meaning": "Public client guest login produces a bearer session; guest can read goods list and detail. Only these three samples matched the main-account preview. Shared identity zero is not a personal account."
+    },
+    {
+      "id": "E17",
+      "source": "https://fans8.top/api/goodsList",
+      "kind": "main_account_complete_collection",
+      "observed_at": "2026-10-25T16:04:57.898233+00:00",
+      "run_id": 8,
+      "status": "success",
+      "observations": 4881,
+      "unique_products": 4881,
+      "declared_total": 4881,
+      "duration_seconds": 38.524,
+      "source_page_sample_context": "independent guest browser session",
+      "source_page_samples": {
+        "4344": "0.09405",
+        "7350": "0.03718",
+        "7331": "0.00157"
+      },
+      "page_samples_match_main_account_observations": true,
+      "meaning": "The main-account run completed with matching declared count and unique products; prior incomplete runs remain. Only the three independently viewed guest samples were compared with main-account observations."
     }
   ],
   "defaults": {

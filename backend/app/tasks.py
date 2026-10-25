@@ -13,6 +13,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from . import config
 from .collectors import AuthExpired, CollectorError, Xiaohong66Collector
 from .collectors.fans8 import Fans8Collector
+from .collectors.base import safe_collection_error
 from .db import SessionLocal
 from .models import CollectionRun, DailyAggregate, ErrorCapture, Observation, Platform, Rule, utcnow
 from .security import decrypt_session
@@ -188,8 +189,8 @@ async def execute_run(run_id: int):
                     final_run.status = 'partial' if final_run.products_seen else 'failed'
                     final_run.error_count = 1
                     # Constructor/decryption/cleanup exceptions may embed credentials.
-                    # Persist only the exception type, never arbitrary upstream error text.
-                    final_run.error = f'采集执行异常：{type(failure).__name__}'
+                    # Explain exact local completeness guards; unknown text stays hidden.
+                    final_run.error = safe_collection_error(failure)
                     if final_platform:
                         final_platform.last_error = final_run.error
                     final_db.add(ErrorCapture(run_id=run_id, message=final_run.error))

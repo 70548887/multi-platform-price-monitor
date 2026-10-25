@@ -46,7 +46,9 @@ async def test_observed_get_contract_bearer_decimals_categories_and_site_identit
         assert dict(request.url.params) == {"Id": "1"}
         return httpx.Response(200, json=row(GoodsType=2, KmStock=12))
 
-    async with source(handler) as collector:
+    # Keep verifying the PC client's observed size; full-directory snapshots
+    # are covered independently with the monitoring default of 5000.
+    async with source(handler, rule={"page_size": 48}) as collector:
         assert await collector.check_session()
         assert collector.account_identity == "88"
         pages = [page async for page in collector.iter_pages()]
@@ -243,3 +245,42 @@ def test_rule_validation_locks_read_paths_and_omits_secret_values_from_errors(ru
 
 def test_defaults_and_rule_export_are_consistent():
     assert validate_fans8_rule({}) == FANS8_DEFAULT_RULE
+
+
+@pytest.mark.asyncio
+async def test_full_catalogue_can_fit_one_response_without_following_shifting_pages():
+    list_requests = []
+
+    async def handler(request):
+        if request.url.path.endswith('goodsClassList'):
+            return httpx.Response(200, json=[{'Id': 11, 'Name': 'catalogue'}])
+        assert request.url.path.endswith('goodsList')
+        list_requests.append(request)
+        assert request.url.params['PageCount'] == '5000'
+        assert request.url.params['Page'] == '1'
+        return httpx.Response(200, json={'error': 0, 'info': [row(Id=i) for i in range(1, 5001)], 'count': 5000})
+
+    async with source(handler, rule={'site_admin_id': 1}) as collector:
+        pages = [page async for page in collector.iter_pages()]
+        assert len(pages) == 1
+        assert len(pages[0]) == collector.expected_total == 5000
+        assert len(collector.seen_ids) == 5000
+        assert len(list_requests) == 1
+
+
+@pytest.mark.parametrize('page_size', [0, 5001, True, '5000'])
+def test_large_catalogue_page_still_has_strict_bounded_size(page_size):
+    with pytest.raises(HTTPException):
+        validate_fans8_rule({'page_size': page_size})
+
+
+@pytest.mark.asyncio
+async def test_guest_profile_zero_is_a_valid_shared_session_identity():
+    async def handler(request):
+        assert request.url.path == '/api/userInfo'
+        assert request.url.params['Switch'] == '4'
+        return httpx.Response(200, json={'Id': 0, 'Level': 1})
+
+    async with source(handler) as collector:
+        assert await collector.check_session()
+        assert collector.account_identity == '0'

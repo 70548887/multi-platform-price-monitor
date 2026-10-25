@@ -43,11 +43,11 @@ FANS8_DEFAULT_RULE: dict[str, Any] = {
     "system_data_path": "",
     "page_field": "Page",
     "size_field": "PageCount",
-    "page_size": 48,
+    "page_size": 5000,
     "max_pages": 10000,
     "category_ids": [],
     "per_category": False,
-    "timeout_seconds": 30,
+    "timeout_seconds": 60,
     "max_attempts": 3,
     "field_mapping": {},
     "user_agent": "Mozilla/5.0",
@@ -78,11 +78,13 @@ class Fans8Rule(BaseModel):
     system_data_path: Literal[""] = ""
     page_field: Literal["Page"] = "Page"
     size_field: Literal["PageCount"] = "PageCount"
-    page_size: StrictInt = Field(default=48, ge=1, le=200)
+    # The live endpoint returned all 4,881 products with PageCount=5000.
+    # Reading one response avoids shifting pages while the catalogue changes.
+    page_size: StrictInt = Field(default=5000, ge=1, le=5000)
     max_pages: StrictInt = Field(default=10000, ge=1, le=10000)
     category_ids: list[StrictInt | StrictStr] = Field(default_factory=list, max_length=1000)
     per_category: bool = False
-    timeout_seconds: float = Field(default=30, ge=1, le=60, allow_inf_nan=False)
+    timeout_seconds: float = Field(default=60, ge=1, le=60, allow_inf_nan=False)
     max_attempts: StrictInt = Field(default=3, ge=1, le=3)
     field_mapping: dict[StrictStr, StrictStr] = Field(default_factory=dict)
     user_agent: StrictStr = Field(default="Mozilla/5.0", min_length=1, max_length=512)
@@ -378,8 +380,8 @@ class Fans8Collector(Xiaohong66Collector):
             else:
                 scopes = [None]
             page_size = _integer(self.rule["page_size"], "page size")
-            if not 1 <= page_size <= 1000:
-                raise CollectorError("page_size must be between 1 and 1000")
+            if not 1 <= page_size <= 5000:
+                raise CollectorError("page_size must be between 1 and 5000")
             max_pages = _integer(self.rule.get("max_pages", 10000), "page limit")
             if not max_pages:
                 raise CollectorError("max_pages must be positive")
