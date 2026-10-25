@@ -1,0 +1,24 @@
+{
+  "name": "price-observatory-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "format": "prettier --write src index.html vite.config.ts \"tsconfig*.json\" package.json .prettierrc.json"
+  },
+  "dependencies": {
+    "echarts": "^5.6.0",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "prettier": "3.5.3",
+    "typescript": "~5.7.3",
+    "vite": "^6.1.0",
+    "vue-tsc": "^2.2.0"
+  }
+}

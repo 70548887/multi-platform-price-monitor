@@ -1,0 +1,117 @@
+{
+  "platform": "xiaohong66.com",
+  "observed_at": "2026-10-25",
+  "evidence": [
+    {
+      "id": "E1",
+      "source": "https://www.xiaohong66.com/static/js/home.bee51a53.js",
+      "kind": "public_frontend_static_source",
+      "http_status": 200,
+      "response_characters": 201110,
+      "snippet": "form:{page:1,list_rows:50,goods_category_id:0,goods_name:\"\"}",
+      "meaning": "Catalogue request defaults use list_rows and goods_category_id; zero selects all categories."
+    },
+    {
+      "id": "E2",
+      "source": "https://www.xiaohong66.com/static/js/home.bee51a53.js",
+      "kind": "public_frontend_static_source",
+      "snippet": "handleSelect:function(t){this.loading=!0,this.refreshing=!0,this.form.page=1,this.form.goods_category_id=parseInt(t),this.form.goods_name=\"\",this.getShop()}",
+      "meaning": "Category selection resets pagination and sets an integer category identifier."
+    },
+    {
+      "id": "E3",
+      "source": "https://www.xiaohong66.com/static/js/app.646488a7.js",
+      "kind": "public_frontend_static_source",
+      "http_status": 200,
+      "response_characters": 182401,
+      "snippet": "if(100===e.data.code)...window.location.href=\"/login\"; ... if(110!==e.data.code)return Promise.resolve(e); ...window.location.href=\"/404?msg=\"",
+      "meaning": "Result code 100 expires authentication; code 110 means source access has become unavailable."
+    },
+    {
+      "id": "E4",
+      "source": "https://www.xiaohong66.com/static/js/details.7b16fc34.js",
+      "kind": "public_frontend_static_source",
+      "http_status": 200,
+      "response_characters": 44911,
+      "snippet": "this.$http.getGoods({id:parseInt(this.$route.query.id)})",
+      "meaning": "The product detail endpoint receives an integer id field."
+    },
+    {
+      "id": "E5",
+      "source": "https://www.xiaohong66.com/static/js/chunk-vendors.1815774f.js",
+      "kind": "public_frontend_static_source",
+      "http_status": 200,
+      "response_characters": 2236476,
+      "snippet": "r.isObject(e)?(a(t,\"application/json;charset=utf-8\"),JSON.stringify(e)):e",
+      "meaning": "The bundled Axios default transform serializes object request bodies as JSON. Its header setter only fills an absent header, so the app's explicitly configured form Content-Type remains unchanged."
+    },
+    {
+      "id": "E6",
+      "source": "https://www.xiaohong66.com/",
+      "kind": "public_frontend_static_source",
+      "snippet": "var PROFILE_URL = window.YILE_PROFILE_URL || '/api/customer/Profile/Show'; return request(PROFILE_URL, {credentials: 'include'})",
+      "meaning": "The embedded source client reads the account profile using GET with same-origin browser cookies. The Vue application wrapper separately uses POST."
+    },
+    {
+      "id": "E7",
+      "source": "https://www.xiaohong66.com/static/js/app.646488a7.js",
+      "kind": "public_frontend_static_source",
+      "snippet": "window.open(\"https://console-docs.apipost.cn/preview/d17fac3f101d4795/c4885e31f99c8c0e\",\"_blank\")",
+      "meaning": "Official documentation entry observed in the source UI; on 2026-10-25 it redirects with HTTP 301 to the generic workspace.apipost.net homepage, so the product OpenAPI authentication contract remains unverified."
+    },
+    {
+      "id": "E8",
+      "source": "https://www.xiaohong66.com/api/customer/Home/GoodsCategoryList",
+      "kind": "authenticated_httpx_replay",
+      "observed_at": "2026-10-25",
+      "reported_by": "root agent executing the recovered encrypted session",
+      "credentials_recorded": false,
+      "observations": [
+        "GET /api/customer/Profile/Show returned code 0 and a nonempty account identifier.",
+        "The legacy composite form Content-Type produced HTTP 500 for category and detail requests.",
+        "With the same session and endpoint, POST with Content-Type application/json and body {} returned code 0 and a category list containing 75 entries.",
+        "GET and standard form encoding also returned HTTP 200."
+      ],
+      "meaning": "Use standard application/json for JSON request bodies; the static legacy client header is not a valid default for authenticated HTTPX replay. Complete catalogue pagination remains a separate acceptance requirement."
+    },
+    {
+      "id": "E9",
+      "source": "https://www.xiaohong66.com/api/customer/Home/GetGoods",
+      "kind": "authenticated_httpx_replay",
+      "observed_at": "2026-10-25",
+      "reported_by": "root agent executing the recovered encrypted session",
+      "credentials_recorded": false,
+      "observations": [
+        "A JSON string id returned code 1 with a Go uint unmarshal error; an integer id returned code 0.",
+        "Product 9585 current price was 0.007447, price_show_num was 0, unit was empty, and is_close was 2.",
+        "The source product category fields are goods_category_id and goods_category_name."
+      ],
+      "meaning": "Send ASCII numeric product identifiers as JSON integers. Preserve decimal price and treat only is_close 1 as closed; the older 0.007486 sample is not the current quote."
+    },
+    {
+      "id": "E10",
+      "source": "https://www.xiaohong66.com/api/customer/Home/GoodsList",
+      "kind": "authenticated_httpx_replay",
+      "observed_at": "2026-10-25",
+      "reported_by": "root agent executing the recovered encrypted session",
+      "credentials_recorded": false,
+      "observations": [
+        "The first 50 products included 27 with price_show_num 0 and an empty unit, and one with price_show_num 0 and a nonempty unit."
+      ],
+      "meaning": "Together with the observed source display logic, a zero quantity and absent unit means an undeclared price basis, not an invalid own-product price. Keep its source-price series with unit_requires_review and exclude cross-platform normalization. Negative quantities or zero with a declared unit remain invalid_display_quantity."
+    }
+  ],
+  "verification_status": "Static request fields, authenticated GET profile / standard JSON category replay, integer detail identifiers and product 9585 price semantics verified. Complete catalogue pagination remains a separate acceptance requirement.",
+  "defaults": {
+    "page_field": "page",
+    "size_field": "list_rows",
+    "page_size": 50,
+    "category_field": "goods_category_id",
+    "all_category_value": 0,
+    "detail_id_field": "id",
+    "session_method": "GET",
+    "request_encoding": "json",
+    "request_content_type": "application/json",
+    "list_extra": {"goods_name": ""}
+  }
+}
