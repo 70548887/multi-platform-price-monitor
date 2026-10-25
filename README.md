@@ -73,6 +73,14 @@ python scripts/acceptance_watch.py --duration-hours 48 --interval-seconds 300
 
 通过标准包含：实际覆盖 48 小时、健康采样无失败、每个启用平台按周期产生成功批次、无新增失败或不完整批次、无过期会话或陈旧成功时间。观察脚本只验证服务侧证据；采集价格与登录页面样本的一致性仍需按真实平台核验。
 
+记录结束后还需执行独立逐批复核，不能只凭观察器的汇总标志宣布通过：
+
+```powershell
+python scripts/verify_acceptance.py var/acceptance/对应记录文件.jsonl
+```
+
+复核器另写 `.review.json`，保留原始记录；它检查依赖健康、API 运行中断、每批商品数量及耗时、各平台实际采集时间缺口和完整 48 小时覆盖。返回 `0` 才表示通过，`2` 表示仍在观察，`1` 表示未通过或记录不完整。本机已运行的记录无需因增加复核器而重启。
+
 ```powershell
 python -m unittest discover -s scripts/tests -v
 .venv\Scripts\python -m pytest backend/tests
