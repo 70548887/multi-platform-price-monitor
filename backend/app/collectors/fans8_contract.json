@@ -1,0 +1,302 @@
+{
+  "platform_type": "yike",
+  "platform_type_provenance": "Operator confirmed fans8 is the Yike series on 2026-10-25; no vendor/version marker was observed in its public bundle.",
+  "adapter": "Fans8Collector",
+  "observed_at": "2026-10-25",
+  "evidence": [
+    {
+      "id": "E1",
+      "source": "https://fans8.top/indexPc.html",
+      "kind": "public_http_read",
+      "status": 200,
+      "bytes": 3166,
+      "sha256": "21b01a0328a58fd780356e886abb5e3e8df1f4b4ca082964b09f4d19d2cda1a3"
+    },
+    {
+      "id": "E2",
+      "source": "https://fans8.top/assetsPc/index-ed8444f0.js",
+      "kind": "public_http_read",
+      "status": 200,
+      "bytes": 970160,
+      "sha256": "b654f96fe86840a227fede09631d1ffc53bddd6416d12729acd0a640f47a7ef8"
+    },
+    {
+      "id": "E3",
+      "source": "https://fans8.top/assetsPc/index-ed8444f0.js",
+      "kind": "observed_static_client_contract",
+      "offset": 948655,
+      "snippet": ";iq.interceptors.request.use((function(e){const a=localStorage.getItem(\"ACCESS_TOKEN\")?localStorage.getItem(\"ACCESS_TOKEN\"):\"\";return e.headers[\"Content-Type\"]=\"application/x-www-form-urlencoded;charset=UTF-8\",a&&(e.headers.Authorization=\"Bearer \"+a),e}),(function(e){return Promise.reject(e)}));const nq=[\"/api/isIm\"];iq.interceptors.response.use((function(e){if(200!==e.status)return Promise.reject(e.data);i",
+      "meaning": "Raw ACCESS_TOKEN is stored in localStorage and added as Authorization Bearer; request base URL is the current origin."
+    },
+    {
+      "id": "E4",
+      "source": "https://fans8.top/assetsPc/index-ed8444f0.js",
+      "kind": "observed_static_client_contract",
+      "offset": 346319,
+      "snippet": "s\",(()=>{const e=m([]),a=m(\"\");return{classList:e,getGoodsClass:async()=>{const a=await(l={IsAll:1},iq.get(\"/api/goodsClassList\",{params:l}));var l;e.value=a},searchParams:a}}));let Ai=null;function mi(e,a=500,l=!1){if(null!==Ai&&clearTimeout(Ai),l){const l=!A",
+      "meaning": "Categories are GET /api/goodsClassList with IsAll=1; successful client response is the root category array."
+    },
+    {
+      "id": "E5",
+      "source": "https://fans8.top/assetsPc/index-ed8444f0.js",
+      "kind": "observed_static_client_contract",
+      "offset": 489116,
+      "snippet": ");const M=e=>{_.value=e,O()},Y=e=>{U.value=e,K()},O=()=>{const e={Page:_.value,PageCount:U.value};o.system.Id&&(e.AdminId=o.system.Id),r.value.goods_name&&(e.GoodsName=r.value.goods_name),r.value.category_id&&(e.CategoryId=r.value.category_id),r.value.category_id2&&(e.CategoryId2=r.value.category_id2),r.value.category_id3&&(e.CategoryId3=r.value.category_id3),r.value.bq&&(e.Bq=r.value.bq),\"hot\"===r.value.sort?e.IsIndex=1:\"time\"===r.value.sort||(e.Sort=1),G.value=!0,mi((()=>{ds(e).then((e=>{B.value=e.info,I.value=!1,G.value=!1,1===_.value&&(S.value=e.count),0===e.info.length&&1===_.value&&(I.value=!0)}))}),300)},z=s((()=>n.value)),P=s((()=>{const e=z.value.filter((e=>Number(r.value.category_id)==e.Id));let a={};return e.length>0&&(a=e[0]),a.Childern?[{Name:\"全部\",Id:\"\"}].concat(a.Childern):[]})),L=s((()=>{const e=P.value.filter((e=>Number(r.value.category_id2)==e.Id));let a={};return e.length>0&&(a=e[0]),a.Childern?[{Name:\"全部\",Id:\"\"}].concat(a.Childern):[]})),J=()=>{x.value=\"\",b.vlaue=\"\",A.value=!1},j=(e,a)=>{1===e?(r.value.category_id=a.Id,r.value.category_id2=\"\",r.value.category_id3=\"",
+      "meaning": "Full product page uses GET goodsList with Page/PageCount, optional hierarchy filters, system Id as AdminId, info rows and root count total."
+    },
+    {
+      "id": "E6",
+      "source": "https://fans8.top/assetsPc/index-ed8444f0.js",
+      "kind": "observed_static_client_contract",
+      "offset": 536731,
+      "snippet": "st G=m(1),M=()=>{var e;B.value=[],(e={Id:A.value},iq.get(\"/api/goodsDetail\",{params:e})).then((e=>{e.Id||ve.alert(\"商品信息错误，确认返回\",\"Warning\",{confirmButtonText:\"确认\",type:\"warning\"}).then((()=>{c.go(-1)})),1===e.IsTc&&(B.value=[{Title:e.TcTitle,textContent:e.TcContent}],I.value=!0),_.value=e,Q.value=ut(e),U.value=Q.value.goods,document.title=null==e?void 0:e.GoodsName})).catch((e=>{}))},Y=()=>{I.value=!1},O=m(1),T=m(\"\"),z=m(\"\"),P=m(\"\"),L=m(\"\"),J=m(\"\"),j=e=>{O.value=e},H=m(!1),K=()=>{H.value=!0},W=()=>{T.value=`${oe.value} ${ie.value}`,$()},$=()=>{o",
+      "meaning": "Product detail is a GET request with Id and uses a root product object."
+    },
+    {
+      "id": "E7",
+      "source": "https://fans8.top/assetsPc/index-ed8444f0.js",
+      "kind": "observed_static_client_contract",
+      "offset": 283162,
+      "snippet": "bo_count:0}),l=m([]);return{userinfo:e,allCount:a,getUserInfo:()=>new Promise(((a,t)=>{var s;iq.get(\"/api/userInfo\",{params:{...s,Switch:4}}).then((async s=>{const o=uq();s.Id||0===s.Id?(s.PhoneStr=s.Phone,e.value=s,s.Level<50?2===o.mode?l.value=[{title:\"个人资料\",name:\"information\",nameArr:[\"information\"]},{title:\"升级会员\",name:\"vip\",nameArr:[\"vip\"]},{title:\"账户余额\",name:\"account\",name",
+      "meaning": "Profile is GET /api/userInfo with Switch=4 and root object Id."
+    },
+    {
+      "id": "E8",
+      "source": "https://fans8.top/assetsPc/index-ed8444f0.js",
+      "kind": "observed_static_client_contract",
+      "offset": 949255,
+      "snippet": "data.info&&sq.replace({path:\"/login\"})}))),e.data}if(3===e.data.error)sq.replace({path:\"/login\"});else{if(4!==e.data.error)return e.data;sq.replace({path:\"/404\",query:{text:e.data.info}})}}),(function(e){return Promise.reject(e)}));const rq=e=>iq.get(\"/common/getSetting",
+      "meaning": "Source error 3 requires login; error 4 routes to source unavailable. No code=100 rule exists for this frontend."
+    },
+    {
+      "id": "E9",
+      "source": "https://fans8.top/assetsPc/index-ed8444f0.js",
+      "kind": "observed_static_client_contract",
+      "offset": 25628,
+      "snippet": "e&&(s=t+\"-12-31\"),e||(s=t+\"-01-01/\"+t+\"-12-31\"),s}function ut(e){const a={count:1},l=e.Bs?parseInt(e.Bs):1,t=e.MinOrderNum&&parseInt(e.MinOrderNum)>0?parseInt(e.MinOrderNum):1,s=e.MaxOrderNum?-1===parseInt(e.MaxOrderNum)?Number.MAX_SAFE_INTEGER:parseInt(e.MaxOrderNum):Number.MAX_SAFE_INTEGER;a.count=e.Count?e.Count:e.count?e.count:t;const o={count:[{type:\"number\",required:!0,message:\"请输入下单数量\",trigger:[\"blur\",\"change\"]},{validator:(e,a,t)=>a%l==0,message:`下单数量必须是${l}的倍数`,trigger:[\"change\",\"blur\"]},{validator:(e,a,l)=>a>=t&&a<=s,message:`下单数量必须在${t}~${s}范围内`,trigger:[\"change\",\"blur\"]}]};let i=lt.jsonString(e.ParamsTemplate)?JSON.parse(e.ParamsT",
+      "meaning": "Bs is the order-step multiplier, not a price display quantity."
+    },
+    {
+      "id": "E10",
+      "source": "https://fans8.top/assetsPc/index-ed8444f0.js",
+      "kind": "observed_static_client_contract",
+      "offset": 547455,
+      "snippet": "(\"\",!0)]),f(\"div\",lp,[tp,b(h(_.value.Id),1)]),2===_.value.GoodsType?(v(),p(\"div\",sp,[op,b(h(_.value.KmStock),1)])):(v(),p(\"div\",ip,[np,b(h(-1===_.value.GoodsStock?\"无限\":_.value.GoodsStock),1)])),2===n.value?(v(),p(\"div\",rp,[dp,f(\"div\",cp,\" ¥\"+h(t(tt)(_.value.GoodsPrice)),1)])):(v(),p(\"div\",up,[Ap,mp,f(\"span\",gp,h(t(tt)(_.value.GoodsPrice)),1)]))])):y(\"\",!0)]),f(\"div\",vp,[2!==n.value?(v(),p(\"div\",pp,[f(\"div\",fp,[f(\"div\",hp,[f(\"div\",yp,h(_",
+      "meaning": "GoodsType=2 uses KmStock; otherwise GoodsStock=-1 is displayed as unlimited."
+    },
+    {
+      "id": "E11",
+      "source": "https://fans8.top/api/getSys",
+      "kind": "anonymous_read_only_http_replay",
+      "method": "GET",
+      "params": {},
+      "http_status": 200,
+      "credentials_recorded": false,
+      "response_keys": [
+        "Id",
+        "Ico",
+        "Logo",
+        "SiteName",
+        "ContactType1",
+        "Contact1",
+        "ContactType2",
+        "Contact2",
+        "ContactType3",
+        "Contact3",
+        "ContactType4",
+        "Contact4",
+        "QqQun",
+        "Wx",
+        "SiteBhh",
+        "SiteYys",
+        "SiteIcp",
+        "SiteBqsy",
+        "SiteKey",
+        "SiteMs",
+        "Status",
+        "AppDown",
+        "IosDown",
+        "PcType"
+      ],
+      "observed": {
+        "Id": 1,
+        "PcType": 1,
+        "vendor_marker": null,
+        "version_marker": null
+      }
+    },
+    {
+      "id": "E12",
+      "source": "https://fans8.top/api/goodsClassList",
+      "kind": "anonymous_read_only_http_replay",
+      "method": "GET",
+      "params": {
+        "IsAll": 1
+      },
+      "http_status": 200,
+      "credentials_recorded": false,
+      "response_keys": [
+        "error",
+        "info",
+        "count",
+        "tj"
+      ],
+      "observed": {
+        "error": 3,
+        "info": "登录状态失效,重新登录!!",
+        "count": 0
+      }
+    },
+    {
+      "id": "E13",
+      "source": "https://fans8.top/api/goodsList",
+      "kind": "anonymous_read_only_http_replay",
+      "method": "GET",
+      "params": {
+        "Page": 1,
+        "PageCount": 12
+      },
+      "http_status": 200,
+      "credentials_recorded": false,
+      "response_keys": [
+        "error",
+        "info",
+        "count",
+        "tj"
+      ],
+      "observed": {
+        "error": 3,
+        "info": "登录状态失效,重新登录!!",
+        "count": 0
+      }
+    },
+    {
+      "id": "E14",
+      "source": "https://fans8.top/api/userInfo",
+      "kind": "anonymous_read_only_http_replay",
+      "method": "GET",
+      "params": {
+        "Switch": 4
+      },
+      "http_status": 200,
+      "credentials_recorded": false,
+      "response_keys": [
+        "error",
+        "info",
+        "count",
+        "tj"
+      ],
+      "observed": {
+        "error": 3,
+        "info": "登录状态失效,重新登录!!",
+        "count": 0
+      }
+    }
+  ],
+  "defaults": {
+    "api_prefix": "",
+    "category_path": "/api/goodsClassList",
+    "category_extra": {
+      "IsAll": 1
+    },
+    "category_data_path": "",
+    "list_path": "/api/goodsList",
+    "list_data_path": "info",
+    "list_total_path": "count",
+    "list_extra": {
+      "Sort": 1
+    },
+    "detail_path": "/api/goodsDetail",
+    "detail_data_path": "",
+    "detail_id_field": "Id",
+    "session_path": "/api/userInfo",
+    "session_extra": {
+      "Switch": 4
+    },
+    "session_data_path": "",
+    "system_path": "/api/getSys",
+    "system_data_path": "",
+    "page_field": "Page",
+    "size_field": "PageCount",
+    "page_size": 48,
+    "max_pages": 10000,
+    "category_ids": [],
+    "per_category": false,
+    "timeout_seconds": 30,
+    "max_attempts": 3,
+    "field_mapping": {},
+    "user_agent": "Mozilla/5.0",
+    "allowed_hosts": [],
+    "site_admin_id": null
+  },
+  "verification_status": {
+    "public_html_and_bundle": "verified HTTP 200",
+    "anonymous_api_reads": "verified; protected endpoints returned error 3",
+    "authenticated_catalogue": "not executed; requires operator login session",
+    "mock_contract_tests": "32 passed; combined collector and local connector regression suite: 54 passed, 4 subtests passed",
+    "vendor_version": "unverified from public artifacts"
+  },
+  "execution_ledger": {
+    "read_skills": [
+      "C:/Users/Administrator/.agents/skills/reverse-engineering-api/SKILL.md"
+    ],
+    "commands": [
+      {
+        "id": "C1",
+        "action": "Read skill, collector file inventory, workspace directory inventory"
+      },
+      {
+        "id": "C2",
+        "action": "Read existing collector/session/types/test contract; GET exact supplied indexPc.html"
+      },
+      {
+        "id": "C3",
+        "action": "GET referenced main module index-ed8444f0.js; extract observed API/import/auth markers"
+      },
+      {
+        "id": "C4",
+        "action": "Extract main module endpoint paths and exact auth/profile/category/detail call sites"
+      },
+      {
+        "id": "C5",
+        "action": "Extract main module pagination and source product fields"
+      },
+      {
+        "id": "C6",
+        "action": "GET observed getSys, category IsAll=1, goodsList Page1 PageCount12, userInfo Switch4; no credentials"
+      },
+      {
+        "id": "C7",
+        "action": "Extract stock/price/order-step semantics from main module"
+      },
+      {
+        "id": "C8",
+        "action": "Extract full catalogue page count contract and absent vendor/version markers"
+      },
+      {
+        "id": "C9",
+        "action": "Read existing worker collector interface usages"
+      },
+      {
+        "id": "C10",
+        "action": "Read current rule_config typed validation and error policy"
+      },
+      {
+        "id": "C11",
+        "action": "Run backend/tests/test_fans8.py: 31 passed"
+      },
+      {
+        "id": "C12",
+        "action": "Read platform registry, local connector and connector tests; read API platform metadata and rule-list response schema"
+      },
+      {
+        "id": "C13",
+        "action": "Implement metadata-directed Fans8 login navigation/storage capture, adapter-dispatched profile validation, generic session cookie capture and selected custom-domain rules"
+      },
+      {
+        "id": "C14",
+        "action": "Run only backend/tests/test_fans8.py and scripts/tests/test_connect_platform.py: 54 passed, 4 subtests passed"
+      }
+    ]
+  }
+}

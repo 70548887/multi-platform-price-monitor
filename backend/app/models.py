@@ -28,6 +28,7 @@ class Platform(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
     base_url: Mapped[str] = mapped_column(String(500))
+    platform_type: Mapped[str] = mapped_column(String(40), default='yile', server_default='yile')
     adapter: Mapped[str] = mapped_column(String(40), default='xiaohong66')
     account_label: Mapped[str] = mapped_column(String(120), default='主采集账号')
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)

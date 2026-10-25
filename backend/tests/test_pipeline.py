@@ -60,6 +60,7 @@ def isolated_database():
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
         connection.execute(text('ALTER TABLE platforms ADD COLUMN IF NOT EXISTS account_fingerprint VARCHAR(64)'))
+        connection.execute(text("ALTER TABLE platforms ADD COLUMN IF NOT EXISTS platform_type VARCHAR(40) NOT NULL DEFAULT 'yile'"))
     yield
     engine.dispose()
 

@@ -12,11 +12,13 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 from . import config
 from .collectors import AuthExpired, CollectorError, Xiaohong66Collector
+from .collectors.fans8 import Fans8Collector
 from .db import SessionLocal
 from .models import CollectionRun, DailyAggregate, ErrorCapture, Observation, Platform, Rule, utcnow
 from .security import decrypt_session
 from .services import add_event, persist_page
 from .limits import PlatformLease
+from .platform_registry import adapter_supported
 
 celery_app = Celery('price_monitor', broker=config.REDIS_URL, backend=config.REDIS_URL)
 celery_app.conf.update(
@@ -35,6 +37,8 @@ def redis_client():
 
 
 def queue_run(db, platform, scheduled_at=None):
+    if not adapter_supported(platform):
+        raise ValueError('平台采集版本尚待验证')
     if not platform.active_rule_id:
         raise ValueError('平台尚未发布采集规则')
     existing = db.scalar(select(CollectionRun).where(CollectionRun.platform_id == platform.id,
@@ -78,12 +82,15 @@ def dispatch_due():
                     add_event(db, key=f'run:{run.id}:failed', kind='collection_failed', title='采集批次不完整',
                               message=run.error, platform_id=run.platform_id, run_id=run.id, severity='error')
         for platform in db.scalars(select(Platform).where(Platform.enabled.is_(True), Platform.auth_status == 'connected', Platform.active_rule_id.is_not(None), Platform.next_due_at <= now)):
+            if not adapter_supported(platform):
+                continue
             queue_run(db, platform, platform.next_due_at)
             while platform.next_due_at <= now:
                 platform.next_due_at += timedelta(seconds=platform.interval_seconds)
         db.commit()
-        ids = list(db.scalars(select(CollectionRun.id).where(CollectionRun.status == 'queued',
-            (CollectionRun.dispatched_at.is_(None)) | (CollectionRun.dispatched_at < now-timedelta(seconds=120)))))
+        ids = [run.id for run in db.scalars(select(CollectionRun).where(CollectionRun.status == 'queued',
+            (CollectionRun.dispatched_at.is_(None)) | (CollectionRun.dispatched_at < now-timedelta(seconds=120))))
+            if (platform := db.get(Platform, run.platform_id)) and adapter_supported(platform)]
     for run_id in ids:
         dispatch_one(run_id)
     return {'dispatched': len(ids)}
@@ -108,6 +115,8 @@ async def execute_run(run_id: int):
                 rule = db.get(Rule, run.rule_id)
                 if not platform or not rule:
                     raise RuntimeError('Collection configuration is missing')
+                if not adapter_supported(platform):
+                    raise CollectorError('平台采集版本尚待验证')
                 if not platform.encrypted_session:
                     missing_session = True
                     raise AuthExpired('采集账号未连接')
@@ -123,7 +132,8 @@ async def execute_run(run_id: int):
 
                 lease = PlatformLease(rc, platform.id, platform.request_interval, owner=owner, heartbeat=heartbeat)
                 await lease.start()
-                collector = Xiaohong66Collector(platform.base_url, decrypt_session(platform.encrypted_session), rule.config,
+                source_class = Xiaohong66Collector if platform.adapter == 'xiaohong66' else Fans8Collector
+                collector = source_class(platform.base_url, decrypt_session(platform.encrypted_session), rule.config,
                                                request_gate=lease.gate, sleep=lease.sleep)
                 async for page in collector.iter_pages():
                     lease.renew()

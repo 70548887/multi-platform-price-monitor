@@ -20,6 +20,7 @@ import hashlib
 import importlib
 import inspect
 import ipaddress
+import json
 import os
 from pathlib import Path
 import re
@@ -33,6 +34,12 @@ from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ADAPTERS = {
+    "xiaohong66": {"login_path": "/", "token_storage_key": "token", "session_path": "/api/customer/Profile/Show",
+                   "native_hosts": {"xiaohong66.com", "www.xiaohong66.com"}},
+    "fans8": {"login_path": "/indexPc.html#/login", "token_storage_key": "ACCESS_TOKEN", "session_path": "/api/userInfo",
+              "native_hosts": {"fans8.top"}},
+}
 
 
 class ConnectionFailure(Exception):
@@ -178,8 +185,8 @@ def validate_monitor_url(value: str) -> str:
 
 
 def platform_origin(platform: dict[str, Any]) -> str:
-    if platform.get("adapter") != "xiaohong66":
-        raise ConnectionFailure("当前连接工具仅支持 xiaohong66 平台适配器。")
+    if platform.get("adapter") not in SOURCE_ADAPTERS or platform.get("adapter_supported") is False:
+        raise ConnectionFailure("当前平台版本尚未接入连接工具，请选择已支持的采集版本。")
     value = str(platform.get("base_url", ""))
     parts = urlsplit(value)
     if (parts.scheme != "https" or not parts.hostname
@@ -194,6 +201,49 @@ def platform_origin(platform: dict[str, Any]) -> str:
     except ValueError:
         raise ConnectionFailure("平台网址端口无效。") from None
     return value.rstrip("/")
+
+
+def source_login_settings(platform: dict[str, Any]) -> tuple[str, str]:
+    """Use the API's adapter metadata while accepting older platform responses."""
+    origin = platform_origin(platform)
+    defaults = SOURCE_ADAPTERS[str(platform["adapter"])]
+    login_path = platform.get("login_path", defaults["login_path"])
+    storage_key = platform.get("token_storage_key", defaults["token_storage_key"])
+    if (not isinstance(login_path, str) or not login_path.startswith("/") or login_path.startswith("//")
+            or any(ord(char) < 32 for char in login_path) or "\\" in login_path):
+        raise ConnectionFailure("平台登录入口配置无效，请先修正平台元数据。")
+    parts = urlsplit(login_path)
+    if parts.scheme or parts.netloc or parts.query:
+        raise ConnectionFailure("平台登录入口必须是同源路径。")
+    if not isinstance(storage_key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", storage_key):
+        raise ConnectionFailure("平台会话存储字段配置无效。")
+    return origin + login_path, storage_key
+
+
+def _source_options(adapter: str, rule: dict[str, Any] | None = None) -> dict[str, Any]:
+    # Keep the historical two-argument validator and waiter calls compatible
+    # for the established native adapter, including locally patched helpers.
+    options: dict[str, Any] = {"adapter": adapter} if adapter != "xiaohong66" else {}
+    if rule is not None:
+        options["rule"] = rule
+    return options
+
+
+async def source_rule(client: Any, platform: dict[str, Any], origin: str) -> dict[str, Any] | None:
+    """Load an explicit allowlist from the selected platform's configured rule."""
+    adapter = str(platform["adapter"])
+    if str(urlsplit(origin).hostname).lower().rstrip(".") in SOURCE_ADAPTERS[adapter]["native_hosts"]:
+        return None
+    response = await api_json(client, "GET", f"/api/platforms/{platform['id']}/rules", action="读取平台采集规则")
+    rules = response.get("items", []) if isinstance(response, dict) else []
+    rules = [item for item in rules if isinstance(item, dict) and isinstance(item.get("config"), dict)]
+    active_id = platform.get("active_rule_id")
+    selected = next((item for item in rules if active_id is not None and item.get("id") == active_id), None)
+    if selected is None:
+        selected = max(rules, key=lambda item: item.get("version", 0) if isinstance(item.get("version"), int) else 0, default=None)
+    if selected is None:
+        raise ConnectionFailure("自定义平台域名需要先配置采集规则和 allowed_hosts。")
+    return dict(selected["config"])
 
 
 def installed_channels() -> list[str]:
@@ -276,24 +326,39 @@ async def launch_visible_browser(playwright: Any, channel: str) -> Any:
     raise ConnectionFailure("浏览器启动失败，请安装 Chrome 或 Edge，或使用 --browser 指定已安装的浏览器。")
 
 
-async def validate_source_session(origin: str, session: str) -> None:
+async def validate_source_session(origin: str, session: str, *, adapter: str = "xiaohong66", rule: dict[str, Any] | None = None) -> None:
     backend_path = str(ROOT / "backend")
     if backend_path not in sys.path:
         sys.path.insert(0, backend_path)
     from app.collectors import Xiaohong66Collector
+    from app.collectors.fans8 import Fans8Collector
     from app.collectors.session import decode_session_envelope
 
     decode_session_envelope(session, origin)
-    async with Xiaohong66Collector(origin, session, rule={"max_attempts": 1}) as source:
+    collectors = {"xiaohong66": Xiaohong66Collector, "fans8": Fans8Collector}
+    source_class = collectors.get(adapter)
+    if source_class is None:
+        raise ConnectionFailure("当前平台版本尚未接入会话校验。")
+    async with source_class(origin, session, rule={**dict(rule or {}), "max_attempts": 1}) as source:
         await source.check_session()
 
 
-async def wait_for_source_token(browser: Any, context: Any, origin: str, timeout: int, capture_callback: Any = None) -> str:
+async def wait_for_source_token(browser: Any, context: Any, origin: str, timeout: int, capture_callback: Any = None,
+                                *, adapter: str = "xiaohong66", token_storage_key: str | None = None,
+                                rule: dict[str, Any] | None = None) -> str:
     backend_path = str(ROOT / "backend")
     if backend_path not in sys.path:
         sys.path.insert(0, backend_path)
     from app.collectors.session import encode_session_envelope
 
+    defaults = SOURCE_ADAPTERS.get(adapter)
+    if defaults is None:
+        raise ConnectionFailure("当前平台版本尚未接入会话读取。")
+    storage_key = token_storage_key or str(defaults["token_storage_key"])
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", storage_key):
+        raise ConnectionFailure("平台会话存储字段配置无效。")
+    storage_marker = "data" if adapter == "xiaohong66" else storage_key
+    read_state = "() => ({token: window.localStorage.getItem(" + json.dumps(storage_key) + "), has_data: !!window.localStorage.getItem(" + json.dumps(storage_marker) + ")})"
     deadline = time.monotonic() + timeout
     next_diagnostic = 0.0
     next_validation = 0.0
@@ -311,7 +376,7 @@ async def wait_for_source_token(browser: Any, context: Any, origin: str, timeout
                 continue
             diagnostic_page, diagnostic_match = page, True
             try:
-                state = await page.evaluate("() => ({token: window.localStorage.getItem('token'), has_data: !!window.localStorage.getItem('data')})")
+                state = await page.evaluate(read_state)
             except Exception:
                 # Manual login may navigate while the read is in flight.
                 continue
@@ -323,13 +388,13 @@ async def wait_for_source_token(browser: Any, context: Any, origin: str, timeout
                 try:
                     parts = urlsplit(page.url)
                     credential_origin = f"{parts.scheme}://{parts.netloc}"
-                    cookies = await context.cookies([credential_origin, credential_origin + "/api/customer/Profile/Show"])
+                    cookies = await context.cookies([credential_origin, credential_origin + str(defaults["session_path"])])
                     session = encode_session_envelope(credential_origin, token=token, cookies=cookies)
                     if capture_callback is not None:
                         captured = capture_callback(session)
                         if inspect.isawaitable(captured):
                             await captured
-                    await validate_source_session(origin, session)
+                    await validate_source_session(origin, session, **_source_options(adapter, rule))
                     print("平台账户资料校验通过，正在连接监控后台。", flush=True)
                     return session
                 except Exception as exc:
@@ -412,9 +477,12 @@ async def connect(args: argparse.Namespace, httpx: Any, playwright_module: Any) 
         if platform is None:
             raise ConnectionFailure("指定平台不存在，请先在监控后台创建平台。")
         origin = platform_origin(platform)
+        adapter = str(platform["adapter"])
+        login_url, storage_key = source_login_settings(platform)
+        rule = await source_rule(client, platform, origin)
         if pending is not None:
             try:
-                await validate_source_session(origin, pending)
+                await validate_source_session(origin, pending, **_source_options(adapter, rule))
                 await api_json(client, "PUT", f"/api/platforms/{args.platform_id}/session", action="恢复平台会话", json={"token": pending}, headers={"X-CSRF-Token": csrf})
             except Exception as exc:
                 raise ConnectionFailure("恢复会话未完成（" + _safe_error_summary(exc) + "），加密文件已保留。") from None
@@ -441,7 +509,7 @@ async def connect(args: argparse.Namespace, httpx: Any, playwright_module: Any) 
                 page = await context.new_page()
                 print("请在已打开的独立浏览器中手动登录平台账号；完成登录后将自动连接。", flush=True)
                 try:
-                    await page.goto(origin, wait_until="domcontentloaded", timeout=args.navigation_timeout * 1000)
+                    await page.goto(login_url, wait_until="domcontentloaded", timeout=args.navigation_timeout * 1000)
                 except playwright_module.TimeoutError as exc:
                     if _same_origin(page.url, origin):
                         print("平台页面加载较慢，继续等待人工登录。", flush=True)
@@ -452,7 +520,11 @@ async def connect(args: argparse.Namespace, httpx: Any, playwright_module: Any) 
                 connection_deadline = time.monotonic() + args.timeout
                 next_upload_diagnostic = 0.0
                 while time.monotonic() < connection_deadline:
-                    session = await wait_for_source_token(browser, context, origin, max(1, int(connection_deadline - time.monotonic())), capture_callback=capture_candidate)
+                    wait_options = _source_options(adapter, rule)
+                    if storage_key != SOURCE_ADAPTERS["xiaohong66"]["token_storage_key"] or adapter != "xiaohong66":
+                        wait_options["token_storage_key"] = storage_key
+                    session = await wait_for_source_token(browser, context, origin, max(1, int(connection_deadline - time.monotonic())),
+                                                          capture_callback=capture_candidate, **wait_options)
                     try:
                         await api_json(client, "PUT", f"/api/platforms/{args.platform_id}/session", action="连接平台会话", json={"token": session}, headers={"X-CSRF-Token": csrf})
                     except ConnectionFailure as exc:

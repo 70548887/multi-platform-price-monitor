@@ -13,13 +13,14 @@ from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import config
 from .collectors import AuthExpired, CollectorError, DEFAULT_RULE, Xiaohong66Collector
+from .collectors.fans8 import Fans8Collector
 from .db import Base, SessionLocal, engine, get_db
 from .models import (AuditLog, CanonicalProduct, CollectionRun, DailyAggregate, Event, Observation,
                      Platform, Product, Rule, User, utcnow)
@@ -29,6 +30,8 @@ from .services import decimal_text, display_price, event_dict, iso, json_safe, p
 from .tasks import dispatch_one, queue_run, redis_client
 from .operations import platform_operation
 from .rule_config import validate_rule_config
+from .platform_registry import (PLATFORM_TYPES, adapter_info, adapter_default_rule,
+                                adapter_supported, require_supported, validate_adapter_rule)
 
 STARTED = time.monotonic()
 
@@ -40,6 +43,7 @@ async def lifespan(app):
         connection.execute(text('SELECT pg_advisory_xact_lock(71960200)'))
         Base.metadata.create_all(connection)
         connection.execute(text('ALTER TABLE platforms ADD COLUMN IF NOT EXISTS account_fingerprint VARCHAR(64)'))
+        connection.execute(text("ALTER TABLE platforms ADD COLUMN IF NOT EXISTS platform_type VARCHAR(40) NOT NULL DEFAULT 'yile'"))
     with SessionLocal() as db:
         if db.scalar(select(User.id).limit(1)) is None:
             if len(config.ADMIN_PASSWORD) < 12:
@@ -77,12 +81,20 @@ def page_result(items, total=None, page=1, page_size=50):
 
 
 def platform_dict(db, p):
+    family, version = adapter_info(p.adapter)
+    count = db.scalar(select(func.count()).select_from(Product).where(Product.platform_id == p.id))
     return {'id': p.id, 'name': p.name, 'base_url': p.base_url, 'adapter': p.adapter,
+            'platform_type': p.platform_type, 'platform_type_name': family['name'] if family and family['id'] == p.platform_type else '待识别类型',
+            'adapter_name': version['name'] if version else '待识别版本', 'adapter_supported': adapter_supported(p),
+            'adapter_note': version['note'] if version else '需要核对采集版本',
+            'login_path': version['login_path'] if version else '/',
+            'token_storage_key': version['token_storage_key'] if version else '',
+            'type_locked': bool(count or p.encrypted_session or p.active_rule_id),
             'account_label': p.account_label, 'enabled': p.enabled, 'interval_seconds': p.interval_seconds,
             'request_interval': float(p.request_interval), 'auth_status': p.auth_status,
             'last_success_at': iso(p.last_success_at), 'last_error': p.last_error,
             'active_rule_id': p.active_rule_id,
-            'product_count': db.scalar(select(func.count()).select_from(Product).where(Product.platform_id == p.id))}
+            'product_count': count}
 
 
 def rule_dict(rule):
@@ -152,7 +164,8 @@ def logout(request: Request, user: User = Depends(current_user)):
 class PlatformInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     base_url: str
-    adapter: Literal['xiaohong66'] = 'xiaohong66'
+    platform_type: Literal['yile', 'yike'] | None = None
+    adapter: Literal['xiaohong66', 'fans8', 'yike'] | None = None
     account_label: str = Field(default='主采集账号', min_length=1, max_length=120)
     enabled: bool = True
     interval_seconds: int = Field(default=3600, ge=3600, le=604800)
@@ -162,6 +175,24 @@ class PlatformInput(BaseModel):
     @classmethod
     def validate_url(cls, value):
         return validate_base_url(value)
+
+    @model_validator(mode='after')
+    def bind_adapter(self):
+        if self.adapter is None:
+            self.adapter = 'fans8' if self.platform_type == 'yike' else 'xiaohong66'
+        family, version = adapter_info(self.adapter)
+        if self.platform_type is None:
+            self.platform_type = family['id']
+        if self.platform_type != family['id']:
+            raise ValueError('平台类型与采集版本不匹配')
+        if not version['implemented']:
+            self.enabled = False
+        return self
+
+
+@app.get('/api/platform-types')
+def platform_types(user=Depends(current_user)):
+    return {'items': PLATFORM_TYPES}
 
 
 @app.get('/api/platforms')
@@ -175,7 +206,7 @@ def create_platform(body: PlatformInput, db: Session = Depends(get_db), user=Dep
     p = Platform(**body.model_dump())
     db.add(p)
     db.flush()
-    rule = Rule(platform_id=p.id, version=1, status='draft', config=default_rule(), notes='初始规则，连接账号后测试并发布')
+    rule = Rule(platform_id=p.id, version=1, status='draft', config=adapter_default_rule(p.adapter), notes='初始规则，连接账号后测试并发布')
     db.add(rule)
     audit(db, user, 'create_platform', str(p.id))
     db.commit()
@@ -185,6 +216,19 @@ def create_platform(body: PlatformInput, db: Session = Depends(get_db), user=Dep
 @app.put('/api/platforms/{platform_id}')
 def edit_platform(platform_id: int, body: PlatformInput, db: Session = Depends(get_db), user=Depends(admin_user)):
     p = require(db, Platform, platform_id)
+    db.refresh(p, with_for_update=True)
+    changed_version = body.adapter != p.adapter or body.platform_type != p.platform_type
+    if changed_version:
+        if p.encrypted_session or p.active_rule_id or db.scalar(select(Product.id).where(Product.platform_id == p.id).limit(1)):
+            raise HTTPException(409, '已有会话、已发布规则或商品历史，请新增平台连接以更换类型或版本')
+        if db.scalar(select(CollectionRun.id).where(CollectionRun.platform_id == p.id, CollectionRun.status.in_(['running', 'queued']))):
+            raise HTTPException(409, '请等待当前采集批次结束后更换版本')
+        rules = db.scalars(select(Rule).where(Rule.platform_id == p.id)).all()
+        for previous in rules:
+            previous.status, previous.test_ok = 'archived', False
+        db.add(Rule(platform_id=p.id, version=max((r.version for r in rules), default=0)+1,
+                    status='draft', config=adapter_default_rule(body.adapter), notes='更换平台版本后的初始规则'))
+        p.auth_status, p.account_fingerprint, p.last_error = 'missing', None, None
     if body.base_url != p.base_url or body.account_label != p.account_label:
         if body.account_label != p.account_label and db.scalar(select(Product.id).where(Product.platform_id == p.id).limit(1)):
             raise HTTPException(409, '采集账号标识用于关联历史，已有商品后不能更改；新账号请新增平台连接')
@@ -206,11 +250,14 @@ class SessionInput(BaseModel):
 @app.put('/api/platforms/{platform_id}/session')
 async def connect_session(platform_id: int, body: SessionInput, db: Session = Depends(get_db), user=Depends(admin_user)):
     p = require(db, Platform, platform_id)
+    db.refresh(p, with_for_update=True)
+    require_supported(p)
     configured = db.get(Rule, p.active_rule_id) if p.active_rule_id else db.scalar(select(Rule).where(Rule.platform_id == p.id).order_by(Rule.version.desc()))
     async with platform_operation(p) as gate:
         collector = None
         try:
-            collector = Xiaohong66Collector(p.base_url, body.token, configured.config if configured else default_rule(), request_gate=gate, sleep=gate.sleep)
+            source_class = Xiaohong66Collector if p.adapter == 'xiaohong66' else Fans8Collector
+            collector = source_class(p.base_url, body.token, configured.config if configured else adapter_default_rule(p.adapter), request_gate=gate, sleep=gate.sleep)
             await collector.check_session()
         except CollectorError as exc:
             raise HTTPException(400, '会话校验失败，请确认账号已登录且平台地址正确') from exc
@@ -235,6 +282,7 @@ async def connect_session(platform_id: int, body: SessionInput, db: Session = De
 @app.post('/api/platforms/{platform_id}/collect')
 def collect_now(platform_id: int, db: Session = Depends(get_db), user=Depends(admin_user)):
     p = require(db, Platform, platform_id)
+    require_supported(p)
     if p.auth_status != 'connected':
         raise HTTPException(400, '请先连接采集账号')
     try:
@@ -257,8 +305,8 @@ def collect_now(platform_id: int, db: Session = Depends(get_db), user=Depends(ad
 
 @app.get('/api/platforms/{platform_id}/default-rule')
 def get_default_rule(platform_id: int, db: Session = Depends(get_db), user=Depends(current_user)):
-    require(db, Platform, platform_id)
-    return default_rule()
+    p = require(db, Platform, platform_id)
+    return adapter_default_rule(p.adapter)
 
 
 class RuleInput(BaseModel):
@@ -278,8 +326,9 @@ def list_rules(platform_id: int, db: Session = Depends(get_db), user=Depends(cur
 
 @app.post('/api/platforms/{platform_id}/rules')
 def create_rule(platform_id: int, body: RuleInput, db: Session = Depends(get_db), user=Depends(admin_user)):
-    require(db, Platform, platform_id)
-    validate_rule(body.config)
+    p = require(db, Platform, platform_id)
+    db.refresh(p, with_for_update=True)
+    validate_adapter_rule(p.adapter, body.config)
     db.execute(text('SELECT pg_advisory_xact_lock(:key)'), {'key': 900000+platform_id})
     version = (db.scalar(select(func.max(Rule.version)).where(Rule.platform_id == platform_id)) or 0)+1
     rule = Rule(platform_id=platform_id, version=version, config=body.config, notes=body.notes)
@@ -297,13 +346,17 @@ class RuleTestInput(BaseModel):
 async def test_rule(rule_id: int, body: RuleTestInput, db: Session = Depends(get_db), user=Depends(admin_user)):
     rule = require(db, Rule, rule_id)
     p = require(db, Platform, rule.platform_id)
+    db.refresh(p, with_for_update=True)
+    db.refresh(rule)
+    require_supported(p)
     if not p.encrypted_session:
         raise HTTPException(400, '请先连接采集账号')
-    validate_rule(rule.config)
+    validate_adapter_rule(p.adapter, rule.config)
     async with platform_operation(p) as gate:
         collector = None
         try:
-            collector = Xiaohong66Collector(p.base_url, decrypt_session(p.encrypted_session), rule.config, request_gate=gate, sleep=gate.sleep)
+            source_class = Xiaohong66Collector if p.adapter == 'xiaohong66' else Fans8Collector
+            collector = source_class(p.base_url, decrypt_session(p.encrypted_session), rule.config, request_gate=gate, sleep=gate.sleep)
             categories = await collector.list_categories()
             if body.source_product_id:
                 products = [await collector.get_product(body.source_product_id)]
@@ -331,6 +384,10 @@ async def test_rule(rule_id: int, body: RuleTestInput, db: Session = Depends(get
 def publish_rule(rule_id: int, db: Session = Depends(get_db), user=Depends(admin_user)):
     rule = require(db, Rule, rule_id)
     p = require(db, Platform, rule.platform_id)
+    db.refresh(p, with_for_update=True)
+    db.refresh(rule)
+    require_supported(p)
+    validate_adapter_rule(p.adapter, rule.config)
     if not rule.test_ok:
         raise HTTPException(400, '请先测试此版本并确认解析成功')
     if db.scalar(select(CollectionRun.id).where(CollectionRun.platform_id == p.id, CollectionRun.status == 'running')):

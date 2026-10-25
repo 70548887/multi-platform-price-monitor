@@ -1,10 +1,22 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api, itemsOf, json, auth, date } from '../api'
+import {
+  fallbackPlatformTypes,
+  platformAdapterName,
+  platformIdentityLocked,
+  platformSupported,
+  platformTypeId,
+  platformTypeName,
+} from '../platformTypes'
+import type { PlatformAdapter, PlatformType } from '../platformTypes'
 import Icon from '../components/Icon.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Modal from '../components/Modal.vue'
 const platforms = ref<any[]>([]),
+  platformTypes = ref<PlatformType[]>(fallbackPlatformTypes),
+  typeFilter = ref(''),
+  directoryError = ref(''),
   loading = ref(true),
   error = ref(''),
   notice = ref(''),
@@ -14,9 +26,14 @@ const platforms = ref<any[]>([]),
   token = ref(''),
   saving = ref(false),
   formError = ref(''),
+  checkingIdentity = ref(false),
+  identityCheckFailed = ref(false),
+  hasPublishedRules = ref(false),
+  previousDefaultUrl = ref(''),
   collecting = ref<number | null>(null)
 const form = reactive({
   name: '',
+  platform_type: 'yile',
   base_url: 'https://www.xiaohong66.com',
   adapter: 'xiaohong66',
   account_label: '监控账号',
@@ -25,6 +42,65 @@ const form = reactive({
   request_interval: 1,
 })
 const admin = computed(() => auth.user?.role === 'admin')
+const filterTypes = computed(() => {
+  const types = platformTypes.value.map((type) => ({ id: type.id, name: type.name }))
+  platforms.value.forEach((platform) => {
+    const id = platformTypeId(platform, platformTypes.value)
+    if (!types.some((type) => type.id === id))
+      types.push({ id, name: platformTypeName(platform, platformTypes.value) })
+  })
+  return types
+})
+const filteredPlatforms = computed(() =>
+  typeFilter.value
+    ? platforms.value.filter(
+        (platform) => platformTypeId(platform, platformTypes.value) === typeFilter.value,
+      )
+    : platforms.value,
+)
+const formTypes = computed(() => {
+  if (!editing.value || platformTypes.value.some((type) => type.id === form.platform_type))
+    return platformTypes.value
+  return [
+    ...platformTypes.value,
+    {
+      id: form.platform_type,
+      name: platformTypeName(editing.value, platformTypes.value),
+      adapters: [],
+    },
+  ]
+})
+const formAdapters = computed<PlatformAdapter[]>(() => {
+  const adapters =
+    platformTypes.value.find((type) => type.id === form.platform_type)?.adapters ?? []
+  if (
+    editing.value &&
+    platformTypeId(editing.value, platformTypes.value) === form.platform_type &&
+    !adapters.some((adapter) => adapter.id === editing.value.adapter)
+  )
+    return [
+      ...adapters,
+      {
+        id: editing.value.adapter,
+        name: platformAdapterName(editing.value, platformTypes.value),
+        implemented: platformSupported(editing.value, platformTypes.value),
+      },
+    ]
+  return adapters
+})
+const selectedAdapter = computed(() =>
+  formAdapters.value.find((adapter) => adapter.id === form.adapter),
+)
+const selectedSupported = computed(() => Boolean(selectedAdapter.value?.implemented))
+const identityLocked = computed(() =>
+  Boolean(
+    editing.value &&
+      (checkingIdentity.value ||
+        identityCheckFailed.value ||
+        hasPublishedRules.value ||
+        platformIdentityLocked(editing.value)),
+  ),
+)
 const monitorOrigin = window.location.origin
 const helperOriginAllowed =
   window.location.protocol === 'https:' ||
@@ -34,7 +110,18 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    platforms.value = itemsOf(await api('/platforms'))
+    const [connections, directory] = await Promise.allSettled([
+      api('/platforms'),
+      api('/platform-types'),
+    ])
+    if (connections.status === 'rejected') throw connections.reason
+    platforms.value = itemsOf(connections.value)
+    if (directory.status === 'fulfilled' && itemsOf<PlatformType>(directory.value).length) {
+      platformTypes.value = itemsOf<PlatformType>(directory.value)
+      directoryError.value = ''
+    } else {
+      directoryError.value = '平台类型目录暂未加载，当前显示已知版本。刷新后可获取最新站点版本。'
+    }
   } catch (e: any) {
     error.value = e.message
   } finally {
@@ -42,32 +129,74 @@ async function load() {
   }
 }
 onMounted(load)
-function open(platform?: any) {
+async function open(platform?: any) {
   editing.value = platform ?? null
+  const typeId = platform
+    ? platformTypeId(platform, platformTypes.value)
+    : (platformTypes.value[0]?.id ?? '')
+  const adapter = platformTypes.value.find((type) => type.id === typeId)?.adapters[0]
   Object.assign(form, {
     name: platform?.name ?? '',
-    base_url: platform?.base_url ?? 'https://www.xiaohong66.com',
-    adapter: platform?.adapter ?? 'xiaohong66',
+    platform_type: typeId,
+    base_url: platform?.base_url ?? adapter?.default_base_url ?? '',
+    adapter: platform?.adapter ?? adapter?.id ?? '',
     account_label: platform?.account_label ?? '监控账号',
     enabled: platform?.enabled ?? true,
     interval_seconds: platform?.interval_seconds ?? 3600,
     request_interval: platform?.request_interval ?? 1,
   })
+  previousDefaultUrl.value = selectedAdapter.value?.default_base_url ?? ''
+  hasPublishedRules.value = false
+  checkingIdentity.value = false
+  identityCheckFailed.value = false
   formError.value = ''
   showForm.value = true
+  if (platform && !platformIdentityLocked(platform) && platform.type_locked === undefined) {
+    checkingIdentity.value = true
+    try {
+      const rules = await api(`/platforms/${platform.id}/rules`)
+      if (editing.value?.id === platform.id)
+        hasPublishedRules.value = itemsOf(rules).some((rule) => rule.status === 'published')
+    } catch {
+      if (editing.value?.id === platform.id) identityCheckFailed.value = true
+    } finally {
+      if (editing.value?.id === platform.id) checkingIdentity.value = false
+    }
+  }
+}
+function updateAdapterDefault() {
+  const nextDefault = selectedAdapter.value?.default_base_url ?? ''
+  const current = form.base_url.trim().replace(/\/$/, '')
+  const previous = previousDefaultUrl.value.trim().replace(/\/$/, '')
+  if (!current || (previous && current === previous)) form.base_url = nextDefault
+  previousDefaultUrl.value = nextDefault
+  if (!selectedSupported.value) form.enabled = false
+}
+function changePlatformType() {
+  form.adapter = formAdapters.value[0]?.id ?? ''
+  updateAdapterDefault()
 }
 async function save() {
+  if (!form.adapter || !selectedAdapter.value) {
+    formError.value = '请选择该平台类型下可配置的站点版本。'
+    return
+  }
   saving.value = true
   formError.value = ''
   try {
     await api(
       editing.value ? `/platforms/${editing.value.id}` : '/platforms',
-      json(editing.value ? 'PUT' : 'POST', form),
+      json(editing.value ? 'PUT' : 'POST', {
+        ...form,
+        enabled: selectedSupported.value && form.enabled,
+      }),
     )
     showForm.value = false
-    notice.value = editing.value
-      ? '平台配置已更新。'
-      : '平台已添加并生成默认规则草稿。请连接账号，再测试并发布规则。'
+    notice.value = !selectedSupported.value
+      ? '平台配置已保存。当前站点版本待验证，验证完成后可连接账号并采集。'
+      : editing.value
+        ? '平台配置已更新。'
+        : '平台已添加并生成默认规则草稿。请连接账号，再测试并发布规则。'
     await load()
   } catch (e: any) {
     formError.value = e.message
@@ -76,6 +205,7 @@ async function save() {
   }
 }
 function connect(platform: any) {
+  if (!platformSupported(platform, platformTypes.value)) return
   sessionPlatform.value = platform
   token.value = ''
   formError.value = ''
@@ -106,6 +236,7 @@ async function saveSession() {
   }
 }
 async function collect(platform: any) {
+  if (!platformSupported(platform, platformTypes.value)) return
   collecting.value = platform.id
   error.value = ''
   try {
@@ -129,17 +260,27 @@ function authLabel(value: string) {
 <template>
   <div class="page-tools">
     <div class="section-description">
-      每个平台独立配置账号、采集频率与规则。<strong>{{ platforms.length }}</strong> 个已接入平台
+      每个平台独立配置账号、采集频率与规则。<strong>{{ platforms.length }}</strong> 个平台连接
     </div>
-    <button v-if="admin" class="btn btn-primary" @click="open()">
-      <Icon name="plus" :size="17" />添加交易平台
-    </button>
+    <div class="filters platform-tools">
+      <select v-model="typeFilter" aria-label="按平台类型筛选">
+        <option value="">全部平台类型</option>
+        <option v-for="type in filterTypes" :key="type.id" :value="type.id">
+          {{ type.name }}
+        </option>
+      </select>
+      <button v-if="admin" class="btn btn-primary" @click="open()">
+        <Icon name="plus" :size="17" />添加交易平台
+      </button>
+    </div>
   </div>
   <div v-if="admin" class="setup-guide">
     <Icon name="link" :size="21" />
     <div>
       <strong>首次接入：添加平台 → 连接账号 → 测试规则 → 发布版本 → 首次采集</strong>
-      <p>新增平台会自动生成默认草稿；登录会话有效且规则已发布后，才会启动自动采集。</p>
+      <p>
+        先选择亿乐或易客，再选择站点版本。已支持的版本会生成默认草稿，账号与规则就绪后启动采集。
+      </p>
     </div>
   </div>
   <div v-if="notice" class="notice success" role="status">
@@ -149,9 +290,12 @@ function authLabel(value: string) {
   <div v-if="error" class="notice error" role="alert">
     {{ error }}<button class="text-link" @click="load">重试</button>
   </div>
+  <div v-if="directoryError && admin" class="notice warning" role="status">
+    {{ directoryError }}<button class="text-link" @click="load">刷新目录</button>
+  </div>
   <div v-if="loading" class="loading-state"><span class="spinner"></span>正在加载平台…</div>
-  <div v-else-if="platforms.length" class="platform-grid">
-    <article v-for="platform in platforms" :key="platform.id" class="panel platform-card">
+  <div v-else-if="filteredPlatforms.length" class="platform-grid">
+    <article v-for="platform in filteredPlatforms" :key="platform.id" class="panel platform-card">
       <div class="platform-card-header">
         <div class="platform-logo"><Icon name="globe" :size="25" /></div>
         <span class="badge" :class="platform.enabled ? 'success' : 'neutral'"
@@ -159,6 +303,12 @@ function authLabel(value: string) {
         >
       </div>
       <h2>{{ platform.name }}</h2>
+      <div class="platform-type-tags">
+        <span class="badge info">{{ platformTypeName(platform, platformTypes) }}</span>
+        <span v-if="!platformSupported(platform, platformTypes)" class="badge warning">
+          站点版本待验证
+        </span>
+      </div>
       <a :href="platform.base_url" target="_blank" rel="noopener noreferrer" class="platform-url"
         >{{ platform.base_url }}<Icon name="external" :size="12"
       /></a>
@@ -177,6 +327,9 @@ function authLabel(value: string) {
             }}<small>{{ platform.interval_seconds % 3600 === 0 ? '小时' : '分钟' }}</small></strong
           >
         </div>
+      </div>
+      <div class="platform-detail">
+        <span>站点版本</span><strong>{{ platformAdapterName(platform, platformTypes) }}</strong>
       </div>
       <div class="platform-detail">
         <span>采集账号</span><strong>{{ platform.account_label }}</strong>
@@ -198,7 +351,10 @@ function authLabel(value: string) {
       <div class="platform-detail">
         <span>最近成功</span><strong>{{ date(platform.last_success_at, true) }}</strong>
       </div>
-      <div v-if="platform.last_error" class="platform-error">
+      <div v-if="!platformSupported(platform, platformTypes)" class="platform-hint setup-hint">
+        <Icon name="alert" :size="13" />当前版本待完成采集验证，暂未开放账号连接和采集。
+      </div>
+      <div v-else-if="platform.last_error" class="platform-error">
         <Icon name="alert" :size="14" />{{ platform.last_error }}
       </div>
       <div v-else-if="!platform.active_rule_id" class="platform-hint setup-hint">
@@ -208,14 +364,13 @@ function authLabel(value: string) {
             : '采集规则尚未发布，等待管理员完成配置。'
         }}
       </div>
-      <div v-else class="platform-hint">
-        适配器 {{ platform.adapter }} · 每 {{ platform.request_interval }} 秒最多 1 次请求
-      </div>
+      <div v-else class="platform-hint">每 {{ platform.request_interval }} 秒最多 1 次请求</div>
       <div v-if="admin" class="platform-actions">
         <button
           class="btn btn-primary btn-sm"
           :disabled="
             collecting === platform.id ||
+            !platformSupported(platform, platformTypes) ||
             !platform.enabled ||
             !platform.active_rule_id ||
             platform.auth_status !== 'connected'
@@ -225,7 +380,12 @@ function authLabel(value: string) {
           <Icon :name="collecting === platform.id ? 'refresh' : 'play'" :size="14" />{{
             collecting === platform.id ? '提交中…' : '立即采集'
           }}</button
-        ><button class="btn btn-white btn-sm" @click="connect(platform)">
+        ><button
+          class="btn btn-white btn-sm"
+          :disabled="!platformSupported(platform, platformTypes)"
+          :title="platformSupported(platform, platformTypes) ? '' : '站点版本待验证'"
+          @click="connect(platform)"
+        >
           <Icon name="key" :size="14" />{{
             platform.auth_status === 'missing' ? '连接账号' : '更新会话'
           }}</button
@@ -240,9 +400,15 @@ function authLabel(value: string) {
   <section v-else class="panel">
     <EmptyState
       icon="platforms"
-      title="连接第一个交易平台"
-      description="添加平台、配置采集账号，即可开始自动记录全站商品价格。"
-      ><button v-if="admin" class="btn btn-primary" @click="open()">
+      :title="platforms.length ? '该类型还没有平台连接' : '连接第一个交易平台'"
+      :description="
+        platforms.length
+          ? '选择其他平台类型查看，或为当前类型添加平台连接。'
+          : '添加平台、配置采集账号，即可开始自动记录全站商品价格。'
+      "
+      ><button v-if="platforms.length" class="btn btn-white" @click="typeFilter = ''">
+        查看全部平台</button
+      ><button v-else-if="admin" class="btn btn-primary" @click="open()">
         <Icon name="plus" :size="17" />添加交易平台
       </button></EmptyState
     >
@@ -256,6 +422,53 @@ function authLabel(value: string) {
     @close="!saving && (showForm = false)"
     ><form @submit.prevent="save">
       <div v-if="formError" class="notice error">{{ formError }}</div>
+      <div class="form-grid">
+        <label>
+          平台类型
+          <select
+            v-model="form.platform_type"
+            required
+            :disabled="identityLocked || saving"
+            @change="changePlatformType"
+          >
+            <option v-for="type in formTypes" :key="type.id" :value="type.id">
+              {{ type.name }}
+            </option>
+          </select>
+          <small>按平台系统类型选择，站点名称可单独设置。</small>
+        </label>
+        <label>
+          站点版本
+          <select
+            v-model="form.adapter"
+            required
+            :disabled="identityLocked || saving || !formAdapters.length"
+            @change="updateAdapterDefault"
+          >
+            <option v-if="!formAdapters.length" value="">版本目录暂未就绪</option>
+            <option v-for="adapter in formAdapters" :key="adapter.id" :value="adapter.id">
+              {{ adapter.name
+              }}{{ adapter.implemented || adapter.name.includes('待验证') ? '' : ' · 待验证' }}
+            </option>
+          </select>
+          <small>选择与目标网站对应的版本。</small>
+        </label>
+      </div>
+      <p v-if="identityLocked" class="form-help platform-identity-note">
+        {{
+          checkingIdentity
+            ? '正在核对已保存记录，类型与站点版本暂时锁定。'
+            : identityCheckFailed
+              ? '记录状态未能核对，类型与站点版本暂时锁定；其他配置可继续保存。'
+              : '该连接已有商品、会话或已发布规则，平台类型与站点版本已固定。更换类型或版本请新建连接。'
+        }}
+      </p>
+      <div v-if="!selectedSupported" class="notice warning">
+        当前站点版本待验证。可先保存平台配置，账号连接和采集将在验证完成后开放。
+        <span v-if="selectedAdapter?.note || selectedAdapter?.description">
+          {{ selectedAdapter.note || selectedAdapter.description }}
+        </span>
+      </div>
       <label
         >平台名称<input
           v-model="form.name"
@@ -267,27 +480,21 @@ function authLabel(value: string) {
           v-model="form.base_url"
           type="url"
           required
-          placeholder="https://www.xiaohong66.com"
+          :placeholder="selectedAdapter?.default_base_url || 'https://请输入目标平台域名'"
       /></label>
-      <div class="form-grid">
-        <label
-          >采集适配器<select v-model="form.adapter">
-            <option value="xiaohong66">Xiaohong66</option>
-          </select></label
-        ><label
-          >采集账号标识（建立商品后固定）<input
-            v-model="form.account_label"
-            required
-            maxlength="120"
-            :disabled="Boolean(editing && editing.product_count > 0)"
-            placeholder="例如：采购监控账号"
-          /><small>{{
-            editing?.product_count > 0
-              ? '已有商品，账号标识已固定；更换采集账号请创建新的平台连接。'
-              : '使用稳定且唯一的账号标识，建立商品后将固定保存。'
-          }}</small></label
-        >
-      </div>
+      <label
+        >采集账号标识（建立商品后固定）<input
+          v-model="form.account_label"
+          required
+          maxlength="120"
+          :disabled="Boolean(editing && editing.product_count > 0)"
+          placeholder="例如：采购监控账号"
+        /><small>{{
+          editing?.product_count > 0
+            ? '已有商品，账号标识已固定；更换采集账号请创建新的平台连接。'
+            : '使用稳定且唯一的账号标识，建立商品后将固定保存。'
+        }}</small></label
+      >
       <div class="form-grid">
         <label
           >采集间隔（秒）<input
@@ -310,12 +517,16 @@ function authLabel(value: string) {
         >
       </div>
       <label class="checkbox-label"
-        ><input v-model="form.enabled" type="checkbox" />启用平台自动采集</label
+        ><input
+          v-model="form.enabled"
+          type="checkbox"
+          :disabled="!selectedSupported"
+        />启用平台自动采集</label
       >
       <div class="modal-actions">
         <button type="button" class="btn btn-white" :disabled="saving" @click="showForm = false">
           取消</button
-        ><button class="btn btn-primary" :disabled="saving">
+        ><button class="btn btn-primary" :disabled="saving || !form.adapter">
           {{ saving ? '保存中…' : '保存平台' }}
         </button>
       </div>
@@ -378,3 +589,25 @@ function authLabel(value: string) {
     </form></Modal
   >
 </template>
+<style scoped>
+.platform-tools {
+  justify-content: flex-end;
+}
+.platform-type-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 9px 0;
+}
+.platform-type-tags .badge {
+  font-size: 9px;
+}
+.platform-detail strong {
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.platform-identity-note {
+  margin-top: -4px;
+  margin-bottom: 18px;
+}
+</style>

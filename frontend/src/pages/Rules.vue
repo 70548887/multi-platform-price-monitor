@@ -2,6 +2,7 @@
 import { onMounted, ref, computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { api, itemsOf, json, date, price, displayBasisLabel, qualityText } from '../api'
+import { platformSupported } from '../platformTypes'
 import Icon from '../components/Icon.vue'
 import Badge from '../components/Badge.vue'
 import EmptyState from '../components/EmptyState.vue'
@@ -25,6 +26,7 @@ const route = useRoute(),
 const selectedConfig = computed(() =>
   selected.value ? JSON.stringify(selected.value.config, null, 2) : '',
 )
+const supported = computed(() => platformSupported(platform.value))
 async function load() {
   loading.value = true
   error.value = ''
@@ -87,7 +89,7 @@ async function save() {
   }
 }
 async function test() {
-  if (!selected.value) return
+  if (!selected.value || !supported.value) return
   const rule = selected.value
   testing.value = true
   error.value = ''
@@ -106,7 +108,7 @@ async function test() {
   }
 }
 async function publish() {
-  if (!selected.value) return
+  if (!selected.value || !supported.value) return
   busy.value = true
   error.value = ''
   try {
@@ -143,9 +145,12 @@ function choose(rule: any) {
     >
   </div>
   <div v-if="error" class="notice error">{{ error }}</div>
+  <div v-if="platform && !supported" class="notice warning">
+    当前站点版本待验证，可管理规则草稿；采集测试与发布将在版本验证完成后开放。
+  </div>
   <div v-if="loading" class="loading-state"><span class="spinner"></span>正在加载规则版本…</div>
   <template v-else-if="rules.length"
-    ><div v-if="platform && !platform.active_rule_id" class="setup-guide">
+    ><div v-if="platform && supported && !platform.active_rule_id" class="setup-guide">
       <Icon name="file" :size="21" />
       <div>
         <strong>首次接入：连接账号 → 测试默认草稿 → 发布规则 → 开始采集</strong>
@@ -201,9 +206,19 @@ function choose(rule: any) {
             <button
               class="btn btn-primary btn-sm"
               :disabled="
-                busy || testing || !selected.test_ok || selected.id === platform?.active_rule_id
+                busy ||
+                testing ||
+                !supported ||
+                !selected.test_ok ||
+                selected.id === platform?.active_rule_id
               "
-              :title="!selected.test_ok ? '请先运行测试，成功后即可发布' : ''"
+              :title="
+                !supported
+                  ? '站点版本待验证'
+                  : !selected.test_ok
+                    ? '请先运行测试，成功后即可发布'
+                    : ''
+              "
               @click="publish"
             >
               {{
@@ -235,7 +250,8 @@ function choose(rule: any) {
                 :disabled="testing || busy"
               /><button
                 class="btn btn-white"
-                :disabled="testing || busy || platform?.auth_status !== 'connected'"
+                :disabled="testing || busy || !supported || platform?.auth_status !== 'connected'"
+                :title="supported ? '' : '站点版本待验证'"
                 @click="test"
               >
                 <Icon :name="testing ? 'refresh' : 'play'" :size="15" />{{

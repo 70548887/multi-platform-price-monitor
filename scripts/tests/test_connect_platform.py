@@ -23,6 +23,7 @@ connector = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(connector)
 sys.path.insert(0, str(ROOT / "backend"))
 import app.collectors as adapters
+import app.collectors.fans8 as fans8_adapters
 from app.collectors.session import SESSION_PREFIX, decode_session_envelope
 
 
@@ -119,6 +120,126 @@ class ConnectorTests(unittest.IsolatedAsyncioTestCase):
     def test_source_origin_aliases_are_limited_to_apex_and_www(self):
         self.assertTrue(connector._matches_source_origin("https://xiaohong66.com/login", "https://www.xiaohong66.com"))
         self.assertFalse(connector._matches_source_origin("https://other.xiaohong66.com/login", "https://www.xiaohong66.com"))
+
+    def test_fans8_login_metadata_and_older_response_defaults(self):
+        platform = {"id": 2, "adapter": "fans8", "base_url": "https://fans8.top"}
+        self.assertEqual(connector.platform_origin(platform), "https://fans8.top")
+        self.assertEqual(connector.source_login_settings(platform), ("https://fans8.top/indexPc.html#/login", "ACCESS_TOKEN"))
+        platform.update(login_path="/indexPc.html#/login", token_storage_key="ACCESS_TOKEN", adapter_supported=True)
+        self.assertEqual(connector.source_login_settings(platform), ("https://fans8.top/indexPc.html#/login", "ACCESS_TOKEN"))
+
+    def test_login_metadata_rejects_foreign_urls_and_unverified_adapters(self):
+        platform = {"id": 2, "adapter": "fans8", "base_url": "https://fans8.top"}
+        for path in ("https://other.example/login", "//other.example/login", "/\\other.example/login", "/login?token=private"):
+            with self.subTest(path=path), self.assertRaises(connector.ConnectionFailure):
+                connector.source_login_settings({**platform, "login_path": path})
+        with self.assertRaises(connector.ConnectionFailure):
+            connector.platform_origin({**platform, "adapter": "yike"})
+        with self.assertRaises(connector.ConnectionFailure):
+            connector.platform_origin({**platform, "adapter_supported": False})
+        self.assertFalse(connector._matches_source_origin("https://www.fans8.top", "https://fans8.top"))
+
+    async def test_fans8_session_validation_dispatches_with_rule_and_one_attempt(self):
+        from app.collectors.session import encode_session_envelope
+        credential = encode_session_envelope("https://fans8.top", token="fixture-fans8-token")
+        seen = []
+
+        class Source:
+            def __init__(self, origin, session, rule=None):
+                seen.append((origin, session, rule))
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def check_session(self):
+                return True
+
+        with patch.object(fans8_adapters, "Fans8Collector", Source):
+            await connector.validate_source_session("https://fans8.top", credential, adapter="fans8", rule={"max_attempts": 3, "site_admin_id": 1})
+        self.assertEqual(seen, [("https://fans8.top", credential, {"max_attempts": 1, "site_admin_id": 1})])
+
+    async def test_custom_source_domain_uses_active_rule_allowlist(self):
+        platform = {"id": 2, "adapter": "fans8", "base_url": "https://custom-source.net", "active_rule_id": 4}
+
+        async def handler(request):
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(request.url.path, "/api/platforms/2/rules")
+            return httpx.Response(200, json={"items": [
+                {"id": 5, "version": 2, "config": {"allowed_hosts": ["different-source.net"]}},
+                {"id": 4, "version": 1, "config": {"allowed_hosts": ["custom-source.net"]}},
+            ]})
+
+        async with httpx.AsyncClient(base_url="http://127.0.0.1", transport=httpx.MockTransport(handler)) as client:
+            self.assertEqual(await connector.source_rule(client, platform, "https://custom-source.net"), {"allowed_hosts": ["custom-source.net"]})
+
+    async def test_fans8_login_navigation_storage_capture_validation_upload_order(self):
+        output, events = io.StringIO(), []
+
+        class Fans8Page(Page):
+            async def goto(self, url, **kwargs):
+                self.url = url
+                events.append(("navigate", url))
+
+            async def evaluate(self, code):
+                self_test.assertIn('getItem("ACCESS_TOKEN")', code)
+                return {"token": "fixture-fans8-token", "has_data": True}
+
+        class Fans8Context(Context):
+            def __init__(self):
+                self.pages = [Fans8Page()]
+
+            async def cookies(self, urls):
+                self_test.assertEqual(urls, ["https://fans8.top", "https://fans8.top/api/userInfo"])
+                return [{"name": "source-session-name", "value": "fixture-fans8-cookie", "domain": "fans8.top", "path": "/", "secure": True}]
+
+        class Store:
+            def save(self, session):
+                events.append(("capture", session))
+
+            def remove(self):
+                events.append(("remove", None))
+
+        context = Fans8Context()
+        browser = Browser(context)
+        self_test = self
+
+        class Chromium:
+            async def launch(self, **kwargs):
+                return browser
+
+        async def validation(origin, session, **kwargs):
+            self.assertEqual(events[-1], ("capture", session))
+            decoded = decode_session_envelope(session, origin)
+            self.assertEqual(decoded.token, "fixture-fans8-token")
+            self.assertEqual(decoded.cookies[0]["name"], "source-session-name")
+            self.assertEqual(kwargs, {"adapter": "fans8"})
+            events.append(("validate", None))
+
+        async def handler(request):
+            if request.url.path == "/api/auth/login":
+                return httpx.Response(200, json={"role": "admin", "csrf_token": "fixture-csrf"})
+            if request.url.path == "/api/platforms":
+                return httpx.Response(200, json={"items": [{"id": 2, "adapter": "fans8", "base_url": "https://fans8.top",
+                                                            "login_path": "/indexPc.html#/login", "token_storage_key": "ACCESS_TOKEN"}]})
+            self.assertEqual(request.url.path, "/api/platforms/2/session")
+            self.assertEqual(request.method, "PUT")
+            self.assertEqual(events[-1][0], "validate")
+            events.append(("upload", None))
+            return httpx.Response(200, json={"ok": True})
+
+        fake_http = types.SimpleNamespace(AsyncClient=lambda **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(handler), **kwargs))
+        fake_playwright = types.SimpleNamespace(TimeoutError=TimeoutError, async_playwright=lambda: Runtime(types.SimpleNamespace(chromium=Chromium())))
+        args = connector.parse_args(["--platform-id", "2"])
+        with patch.object(connector, "pending_session_store", return_value=Store()), patch.object(connector, "credentials", return_value=("fixture-admin", "fixture-password")), patch.object(connector, "validate_source_session", validation), contextlib.redirect_stdout(output):
+            await connector.connect(args, fake_http, fake_playwright)
+        self.assertEqual([event[0] for event in events], ["navigate", "capture", "validate", "upload", "remove"])
+        self.assertEqual(events[0][1], "https://fans8.top/indexPc.html#/login")
+        self.assertTrue(browser.closed)
+        self.assertNotIn("fixture-fans8-token", output.getvalue())
+        self.assertNotIn("fixture-fans8-cookie", output.getvalue())
 
     async def test_cookie_settlement_and_profile_retry_preserve_the_browser(self):
         context = Context()

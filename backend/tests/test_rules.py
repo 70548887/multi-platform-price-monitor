@@ -186,11 +186,14 @@ def _constructor_failure_endpoint(name):
     endpoint.args.defaults = []
 
     platform = SimpleNamespace(id=1, active_rule_id=2, base_url='https://www.xiaohong66.com',
-                               encrypted_session='unit-only-encrypted', account_fingerprint=None)
+                               encrypted_session='unit-only-encrypted', account_fingerprint=None, adapter='xiaohong66')
     rule = SimpleNamespace(platform_id=1, config={}, test_ok=True, tested_at=None)
     state = {'closed': False, 'commits': 0}
 
     class FakeDB:
+        def refresh(self, *args, **kwargs):
+            pass
+
         def get(self, *args):
             return rule
 
@@ -216,6 +219,9 @@ def _constructor_failure_endpoint(name):
         'require': lambda db, model, identifier: platform if model is platform_model else rule,
         'platform_operation': operation, 'decrypt_session': lambda value: value,
         'validate_rule': validate_rule_config, 'default_rule': lambda: {},
+        'require_supported': lambda platform: None,
+        'validate_adapter_rule': lambda adapter, value: validate_rule_config(value),
+        'adapter_default_rule': lambda adapter: {},
         'utcnow': lambda: datetime.now(timezone.utc), 'hashlib': hashlib,
     }
     exec(compile(ast.Module(body=[endpoint], type_ignores=[]), '<pure-endpoint-test>', 'exec'), namespace)
