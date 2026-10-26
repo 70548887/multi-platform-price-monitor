@@ -154,6 +154,31 @@ def steps_for(status):
     return [{'key': key, 'name': name, 'status': 'running' if key == status else 'pending'} for key, name in STEP_NAMES]
 
 
+def host_steps(payload, action):
+    """Normalize the durable host protocol, including older single-step results."""
+    state, phase = payload.get('status'), payload.get('step')
+    aliases = {'validate': 'verify', 'dependencies': 'verify', 'drain': 'backup',
+               'rollback': 'replace', 'manual_restart': 'restart', 'recovery_required': 'health'}
+    phase = aliases.get(phase, phase)
+    keys = [key for key, _ in STEP_NAMES]
+    current = keys.index(phase) if phase in keys else len(keys) - 1
+    done = state in {'succeeded', 'rolled_back'}
+    if phase not in keys and not done:
+        return [{'key': key, 'name': name, 'status': 'pending'} for key, name in STEP_NAMES]
+    result = []
+    for index, (key, name) in enumerate(STEP_NAMES):
+        if action == 'rollback' and key in {'check', 'download', 'verify'}:
+            progress = 'skipped'
+        elif done or index < current:
+            progress = 'completed'
+        elif index == current:
+            progress = 'failed' if state == 'failed' else 'pending' if state == 'applied' else 'running'
+        else:
+            progress = 'pending'
+        result.append({'key': key, 'name': name, 'status': progress})
+    return result
+
+
 def run_dict(run):
     if run is None:
         return None
@@ -205,6 +230,8 @@ def sync_results(db, settings=None):
             run.steps = [{'key': key, 'name': name, 'status': next((s.get('status') for s in payload['steps']
                          if isinstance(s, dict) and s.get('key') == key and s.get('status') in allowed_states), 'pending')}
                          for key, name in STEP_NAMES]
+        else:
+            run.steps = host_steps(payload, run.action)
         percentage = (payload.get('progress') or {}).get('percentage') if isinstance(payload.get('progress'), dict) else None
         if isinstance(percentage, (int, float)) and 0 <= percentage <= 100:
             run.progress = {'percentage': percentage}

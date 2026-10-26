@@ -74,6 +74,7 @@ def test_check_download_apply_and_signed_result_persist_across_api_restarts(admi
                        'updated_at': utcnow().isoformat(), 'progress': {'percentage': 100}}, service.config.SESSION_SECRET)
     state = admin_client.get('/api/update/status').json()
     assert state['run']['status'] == 'succeeded'
+    assert all(step['status'] == 'completed' for step in state['run']['steps'])
     assert state['backups'][0]['id'] == 'run-1.tar.gz'
     assert admin_client.get('/api/update/history').json()['items'][0]['status'] == 'succeeded'
     actions = list(db.scalars(select(AuditLog.action)))
@@ -167,6 +168,21 @@ def test_unsigned_host_results_are_ignored_and_orphan_download_is_failed(admin_c
 def test_zero_interval_no_github_calls(monkeypatch):
     monkeypatch.setattr(service, 'GitHubReleaseClient', lambda *_: (_ for _ in ()).throw(AssertionError('network')))
     assert service.automatic_check() == {'skipped': True}
+
+
+def test_legacy_host_step_progress_is_normalized_without_invented_rollback_checks():
+    rows = service.host_steps({'status': 'applying', 'step': 'backup'}, 'apply')
+    assert next(row for row in rows if row['key'] == 'backup')['status'] == 'running'
+    assert next(row for row in rows if row['key'] == 'health')['status'] == 'pending'
+    failed = service.host_steps({'status': 'failed', 'step': 'recovery_required'}, 'apply')
+    assert failed[-1]['status'] == 'failed'
+    manual = service.host_steps({'status': 'applied', 'step': 'manual_restart'}, 'apply')
+    assert manual[-2]['status'] == manual[-1]['status'] == 'pending'
+    rollback = service.host_steps({'status': 'rolled_back', 'step': 'complete'}, 'rollback')
+    assert [row['status'] for row in rollback[:3]] == ['skipped'] * 3
+    assert all(row['status'] == 'completed' for row in rollback[3:])
+    unknown = service.host_steps({'status': 'failed', 'error_code': 'INVALID_HOST_JOB'}, 'apply')
+    assert all(row['status'] == 'pending' for row in unknown)
 
 
 def test_bad_update_configuration_does_not_pause_business_without_real_marker(admin_client, monkeypatch, isolated_updater):
