@@ -40,10 +40,35 @@ APP_SERVICES = ("api", "worker", "beat", "web")
 TERMINAL_STATES = {"succeeded", "rolled_back", "failed", "applied"}
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+UPDATER_CODE = ('scripts/update_host.py', 'scripts/package_release.py',
+                'backend/app/update_common.py', 'backend/app/update_config.py')
 
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def code_stamp(root: Path) -> tuple:
+    """Fingerprint only updater implementation files, never local settings."""
+    result = []
+    for relative in UPDATER_CODE:
+        path = root / relative
+        if path.is_symlink():
+            raise UpdateError('UNSAFE_UPDATER_CODE', '更新器实现路径不能包含链接')
+        if not path.is_file():
+            result.append((relative, None))
+            continue
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+        result.append((relative, digest.hexdigest()))
+    return tuple(result)
+
+
+def unfinished_journal(data_dir: Path) -> bool:
+    return any(re.fullmatch(r'[1-9][0-9]*\.json', path.name)
+               for path in (data_dir / 'journal').glob('[0-9]*.json'))
 
 
 def read_env(path: Path) -> dict[str, str]:
@@ -739,6 +764,7 @@ def main() -> int:
         except ModuleNotFoundError:
             raise UpdateError('HOST_CONFIG_DEPENDENCY', '宿主机更新器需要安装配置读取依赖 PyYAML') from None
         settings = load_update_config(root=args.root, environ={**values, **os.environ})
+        loaded_code = code_stamp(args.root)
         updater = HostUpdater(args.root, args.data_dir or settings.runtime_dir, args.backup_dir or settings.backup_dir,
                               mode=args.mode, secret=secret, probe=HostProbe(args.health_url, secret),
                               drain_timeout=args.drain_timeout, health_timeout=args.health_timeout)
@@ -747,7 +773,16 @@ def main() -> int:
                 result = updater.run_once()
                 if args.once:
                     return 1 if result and result.get("status") == "failed" else 0
+                if (result and result.get('status') in {'succeeded', 'rolled_back'}
+                        and not unfinished_journal(updater.data_dir)
+                        and code_stamp(args.root) != loaded_code):
+                    break
                 time.sleep(args.poll_seconds)
+        # Release the OS lock before exec: the new interpreter must acquire it
+        # normally and observe terminal job results instead of replaying work.
+        script = str(args.root.resolve() / 'scripts/update_host.py')
+        os.execv(sys.executable, [sys.executable, '-u', script, *sys.argv[1:]])
+        return 0
     except KeyboardInterrupt:
         return 0
     except Exception as exc:

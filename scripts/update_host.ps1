@@ -22,7 +22,7 @@ foreach ($path in @($resolvedData, $resolvedBackup)) {
     }
     [IO.Directory]::CreateDirectory($path) | Out-Null
     $identitySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    & icacls.exe $path '/inheritance:r' '/grant:r' "${identitySid}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+    & icacls.exe $path '/inheritance:r' '/grant:r' "*${identitySid}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Could not protect the updater runtime directory.' }
 }
 if (-not $PythonExe) {

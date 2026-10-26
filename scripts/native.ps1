@@ -84,8 +84,19 @@ function Stop-OwnedApp([string]$Label) {
         $record = $tree[$index]
         $candidate = Get-Process -Id $record.Id -ErrorAction SilentlyContinue
         if ($candidate -and $candidate.Path -eq $record.Path -and $candidate.StartTime.ToUniversalTime() -eq $record.StartedAt) {
-            Stop-Process -Id $candidate.Id
-            $candidate.WaitForExit(10000) | Out-Null
+            try {
+                Stop-Process -Id $candidate.Id -ErrorAction Stop
+                $candidate.WaitForExit(10000) | Out-Null
+            } catch {
+                # Stopping a child can make its launcher exit before its own
+                # turn. A vanished/reused PID already satisfies this stop;
+                # preserve any unrelated replacement and report only a live
+                # process that still matches the verified identity.
+                $remaining = Get-Process -Id $record.Id -ErrorAction SilentlyContinue
+                if ($remaining -and $remaining.Path -eq $record.Path -and $remaining.StartTime.ToUniversalTime() -eq $record.StartedAt) {
+                    throw
+                }
+            }
         }
     }
 }

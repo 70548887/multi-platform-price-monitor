@@ -6,6 +6,7 @@ stop services, read the project's .env, or replace this checkout.
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import sys
@@ -376,6 +377,91 @@ class ActualServiceProbeTests(unittest.TestCase):
                 constructor.return_value.run_once.return_value = None
                 self.assertEqual(update_host.main(), 0)
                 self.assertEqual(constructor.call_args.args[2], root.resolve() / 'data/custom-backups')
+
+
+class DaemonCodeReloadTests(unittest.TestCase):
+    def test_verified_code_change_reloads_after_unlock_and_preserves_arguments(self):
+        for status in ('succeeded', 'rolled_back'):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                application_tree(root)
+                (root / '.env').write_text('SESSION_SECRET=' + SECRET + '\n')
+                arguments = ['--root', str(root), '--mode', 'compose', '--poll-seconds', '7']
+                held = {'value': False}
+                @contextmanager
+                def lock(path):
+                    held['value'] = True
+                    try:
+                        yield
+                    finally:
+                        held['value'] = False
+                def completed():
+                    (root / 'scripts/update_host.py').write_text('# changed fixture updater\n')
+                    return {'status': status}
+                def execute(executable, argv):
+                    self.assertFalse(held['value'])
+                    self.assertEqual(executable, sys.executable)
+                    self.assertEqual(argv, [sys.executable, '-u', str(root.resolve() / 'scripts/update_host.py'), *arguments])
+                with patch.object(sys, 'argv', ['update_host.py', *arguments]), \
+                        patch.object(update_host, 'HostUpdater') as constructor, \
+                        patch.object(update_host, 'process_lock', lock), \
+                        patch.object(update_host.os, 'execv', side_effect=execute) as execv:
+                    constructor.return_value.data_dir = root / 'data/update'
+                    constructor.return_value.run_once.side_effect = completed
+                    self.assertEqual(update_host.main(), 0)
+                    execv.assert_called_once()
+
+    def test_unchanged_code_does_not_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application_tree(root)
+            (root / '.env').write_text('SESSION_SECRET=' + SECRET + '\n')
+            with patch.object(sys, 'argv', ['update_host.py', '--root', str(root)]), \
+                    patch.object(update_host, 'HostUpdater') as constructor, \
+                    patch.object(update_host.os, 'execv') as execv, \
+                    patch.object(update_host.time, 'sleep', side_effect=KeyboardInterrupt):
+                constructor.return_value.data_dir = root / 'data/update'
+                constructor.return_value.run_once.return_value = {'status': 'succeeded'}
+                self.assertEqual(update_host.main(), 0)
+                execv.assert_not_called()
+
+    def test_once_does_not_reload_changed_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application_tree(root)
+            (root / '.env').write_text('SESSION_SECRET=' + SECRET + '\n')
+            def completed():
+                (root / 'scripts/update_host.py').write_text('# changed fixture updater\n')
+                return {'status': 'succeeded'}
+            with patch.object(sys, 'argv', ['update_host.py', '--root', str(root), '--once']), \
+                    patch.object(update_host, 'HostUpdater') as constructor, \
+                    patch.object(update_host.os, 'execv') as execv:
+                constructor.return_value.data_dir = root / 'data/update'
+                constructor.return_value.run_once.side_effect = completed
+                self.assertEqual(update_host.main(), 0)
+                execv.assert_not_called()
+
+    def test_failed_pending_or_unfinished_journal_never_reload(self):
+        for status, journal in (('failed', False), ('applied', False), ('succeeded', True)):
+            with self.subTest(status=status, journal=journal), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                application_tree(root)
+                (root / '.env').write_text('SESSION_SECRET=' + SECRET + '\n')
+                def completed():
+                    (root / 'scripts/update_host.py').write_text('# changed fixture updater\n')
+                    if journal:
+                        path = root / 'data/update/journal/1.json'
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text('fixture unfinished transaction')
+                    return {'status': status}
+                with patch.object(sys, 'argv', ['update_host.py', '--root', str(root)]), \
+                        patch.object(update_host, 'HostUpdater') as constructor, \
+                        patch.object(update_host.os, 'execv') as execv, \
+                        patch.object(update_host.time, 'sleep', side_effect=KeyboardInterrupt):
+                    constructor.return_value.data_dir = root / 'data/update'
+                    constructor.return_value.run_once.side_effect = completed
+                    self.assertEqual(update_host.main(), 0)
+                    execv.assert_not_called()
 
 
 if __name__ == "__main__":

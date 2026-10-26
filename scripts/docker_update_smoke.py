@@ -34,6 +34,63 @@ class SmokeFailure(Exception):
     pass
 
 
+DATA_FINGERPRINT_SCRIPT = '''
+import hashlib, json
+from decimal import Decimal
+from sqlalchemy import select, func
+from app.db import SessionLocal
+from app.models import Platform, Rule, CollectionRun, Product, Observation, utcnow
+from app.security import encrypt_session, decrypt_session
+with SessionLocal() as db:
+    if SEED:
+        if db.scalar(select(func.count()).select_from(Platform)):
+            raise RuntimeError('Isolated database was not empty')
+        now = utcnow()
+        platform = Platform(name='Docker smoke fixture', base_url='https://source.invalid',
+                            enabled=False, account_label='smoke-fixture-account', auth_status='connected',
+                            encrypted_session=encrypt_session('fixture-session-no-upstream-request'))
+        db.add(platform)
+        db.flush()
+        rule = Rule(platform_id=platform.id, version=1, status='published', config={})
+        db.add(rule)
+        db.flush()
+        platform.active_rule_id = rule.id
+        run = CollectionRun(platform_id=platform.id, rule_id=rule.id, account_label=platform.account_label,
+                            scheduled_at=now, started_at=now, completed_at=now, status='success',
+                            products_seen=1, expected_total=1)
+        db.add(run)
+        db.flush()
+        product = Product(platform_id=platform.id, account_label=platform.account_label, source_id='9585',
+                          name='High precision fixture', price=Decimal('0.007486'), display_quantity=Decimal('1000'),
+                          unit='person', status='active', last_run_id=run.id, last_observed_at=now, last_scheduled_at=now)
+        db.add(product)
+        db.flush()
+        db.add(Observation(product_id=product.id, run_id=run.id, rule_id=rule.id, scheduled_at=now,
+                           observed_at=now, name=product.name, price=Decimal('0.007486'),
+                           display_quantity=Decimal('1000'), unit='person', status='active',
+                           raw={'price':'0.007486','price_show_num':'1000'}))
+        db.commit()
+    platform = db.scalar(select(Platform).where(Platform.account_label=='smoke-fixture-account'))
+    if not platform or platform.enabled:
+        raise RuntimeError('Disabled fixture platform was not preserved')
+    product = db.scalar(select(Product).where(Product.platform_id==platform.id, Product.source_id=='9585'))
+    observation = db.scalar(select(Observation).where(Observation.product_id==product.id)) if product else None
+    if not product or not observation or product.price!=Decimal('0.007486') or observation.price!=Decimal('0.007486'):
+        raise RuntimeError('Exact price fixture was not preserved')
+    session = decrypt_session(platform.encrypted_session)
+    if session!='fixture-session-no-upstream-request':
+        raise RuntimeError('Encrypted fixture session was not preserved')
+    payload = {'platform_count':db.scalar(select(func.count()).select_from(Platform)),
+               'product_count':db.scalar(select(func.count()).select_from(Product)),
+               'observation_count':db.scalar(select(func.count()).select_from(Observation)),
+               'rule_id':observation.rule_id, 'run_id':observation.run_id,
+               'price':str(product.price), 'observed_price':str(observation.price),
+               'display_quantity':str(product.display_quantity), 'raw':observation.raw,
+               'encrypted_session':platform.encrypted_session, 'session':session}
+    print(hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest())
+'''
+
+
 class IsolatedRunner:
     def __init__(self, environment: dict[str, str]):
         self.environment = environment
@@ -61,6 +118,14 @@ def unused_loopback_port() -> int:
     with socket.socket() as listener:
         listener.bind(('127.0.0.1', 0))
         return listener.getsockname()[1]
+
+
+def data_fingerprint(runner, compose, root, *, seed=False) -> str:
+    output = runner(compose + ['exec', '-T', 'api', 'python', '-c',
+                              'SEED=' + repr(seed) + '\n' + DATA_FINGERPRINT_SCRIPT], cwd=root, timeout=60)
+    if len(output) != 64 or any(character not in '0123456789abcdef' for character in output):
+        raise SmokeFailure('Isolated database fingerprint response was invalid')
+    return output
 
 
 def copy_release_tree(source: Path, target: Path) -> None:
@@ -152,6 +217,8 @@ def exercise(source: Path, report: dict) -> None:
                     'repository': 'acceptance-fixture/price-monitor', 'auto_restart': True}
         updater._wait_health(base_job, base_version)
         report['initial_health'] = True
+        baseline_data = data_fingerprint(runner, compose, root, seed=True)
+        report['baseline_data_fingerprint'] = baseline_data
 
         report['phase'] = 'build_target_fixture_release'
         target = root / 'data/target-source'
@@ -170,6 +237,9 @@ def exercise(source: Path, report: dict) -> None:
             report['error_code'] = (applied or {}).get('error_code')
             raise SmokeFailure('Real upgrade did not pass target-version health checks')
         report.update(apply_status='succeeded', upgraded_health=True)
+        if data_fingerprint(runner, compose, root) != baseline_data:
+            raise SmokeFailure('Upgrade changed the encrypted session or exact price history fixture')
+        report['upgrade_data_preserved'] = True
         rollback_id = run_id + 2000000000
         rollback_job = {'protocol': 1, 'run_id': rollback_id, 'action': 'rollback',
                         'current_version': target_version, 'target_version': base_version, 'tag': 'v' + base_version,
@@ -184,7 +254,10 @@ def exercise(source: Path, report: dict) -> None:
         persisted = read_signed_json(updater.data_dir / 'results' / f'{rollback_id}.json', secret)
         if persisted.get('version') != base_version:
             raise SmokeFailure('Signed rollback result did not record the restored version')
-        report.update(rollback_status='rolled_back', restored_health=True, status='passed', phase='complete')
+        if data_fingerprint(runner, compose, root) != baseline_data:
+            raise SmokeFailure('Rollback changed the encrypted session or exact price history fixture')
+        report.update(rollback_status='rolled_back', restored_health=True, data_preserved=True,
+                      rollback_data_preserved=True, status='passed', phase='complete')
     finally:
         if report.get('status') != 'passed' and runner.last_error:
             report['diagnostic'] = runner.last_error
