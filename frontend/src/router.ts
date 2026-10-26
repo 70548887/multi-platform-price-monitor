@@ -50,6 +50,11 @@ export const router = createRouter({
       component: () => import('./pages/Users.vue'),
       meta: { title: '成员管理', subtitle: '管理团队账号与访问权限', admin: true },
     },
+    {
+      path: '/settings/update',
+      component: () => import('./pages/SystemUpdate.vue'),
+      meta: { title: '系统更新', subtitle: '检查、安装与回滚正式发布版本', admin: true },
+    },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })

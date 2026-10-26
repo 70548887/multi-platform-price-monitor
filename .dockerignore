@@ -11,5 +11,7 @@
 var
 .runtime
 backups
+data
+config/update.local.yaml
 .idea
 .vscode

@@ -29,7 +29,8 @@ celery_app.conf.update(
     broker_transport_options={'visibility_timeout': 7200, 'global_keyprefix': 'price_monitor:'},
     result_expires=86400,
     beat_schedule={'dispatch-due': {'task': 'app.tasks.dispatch_due', 'schedule': 60.0},
-                   'retention': {'task': 'app.tasks.retain_history', 'schedule': 86400.0}},
+                   'retention': {'task': 'app.tasks.retain_history', 'schedule': 86400.0},
+                   'update-check': {'task': 'app.tasks.check_updates', 'schedule': 60.0}},
 )
 
 
@@ -64,6 +65,11 @@ def dispatch_one(run_id):
 
 @celery_app.task(name='app.tasks.dispatch_due')
 def dispatch_due():
+    from .update_service import maintenance_active
+    rc = redis_client()
+    rc.set('pm:beat:heartbeat', str(time.time()), ex=180)
+    if maintenance_active():
+        return {'maintenance': True}
     now = utcnow()
     with SessionLocal() as db:
         # Scheduler leader election lives in PostgreSQL; multiple beat processes cannot double-plan.
@@ -98,6 +104,9 @@ def dispatch_due():
 
 
 async def execute_run(run_id: int):
+    from .update_service import maintenance_active
+    if maintenance_active():
+        return {'maintenance': True}
     rc = redis_client()
     owner = secrets.token_hex(24)
     with SessionLocal() as db:
@@ -211,6 +220,12 @@ async def execute_run(run_id: int):
 @celery_app.task(name='app.tasks.collect_platform', acks_late=True)
 def collect_platform(run_id):
     return asyncio.run(execute_run(run_id))
+
+
+@celery_app.task(name='app.tasks.check_updates')
+def check_updates():
+    from .update_service import automatic_check
+    return automatic_check()
 
 
 @celery_app.task(name='app.tasks.retain_history')

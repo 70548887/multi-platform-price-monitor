@@ -99,6 +99,38 @@ Pop-Location
 
 ## 备份与密钥
 
+## 在线升级
+
+系统更新页面只允许管理员操作。更新来源是当前 GitHub 仓库的正式 Release，发布资产必须包含 `price-monitor-{version}.tar.gz` 和同名 `.sha256` 校验文件。服务只负责检测、下载、校验和创建更新任务，真正替换代码与重启由宿主机更新器完成。
+
+非敏感配置位于 `config/update.yaml`，GitHub Token 和代理只通过环境变量提供：
+
+```powershell
+$env:UPDATE_GITHUB_TOKEN = '从密码管理器读取的 Token'
+$env:UPDATE_PROXY = '可选的本机代理地址'
+```
+
+Windows 本机模式运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/update_host.ps1 -Mode native
+```
+
+Linux/Docker 部署运行：
+
+```bash
+bash scripts/update_host.sh --mode compose
+```
+
+Docker 部署需让 API 容器用户与宿主机更新器用户使用相同的 `APP_UID`、`APP_GID`，并提前创建可写目录：
+
+```bash
+mkdir -p data/update data/backups
+chown -R "$APP_UID:$APP_GID" data/update data/backups
+```
+
+更新器只替换 Release 清单中的受管文件，保留 `.env`、数据库、Redis、平台会话、历史价格、运行目录和备份。更新失败会恢复最近备份；Docker 更新不挂载 Docker Socket。
+
 Docker 部署可执行：
 
 ```powershell

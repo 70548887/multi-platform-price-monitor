@@ -17,6 +17,8 @@ dist/
 var/
 .runtime/
 backups/
+data/
+config/update.local.yaml
 .DS_Store
 Thumbs.db
 .idea/

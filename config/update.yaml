@@ -1,0 +1,12 @@
+# ========== 服务端自更新配置 ==========
+update:
+  enabled: true
+  github_owner: "70548887"
+  github_repo: "multi-platform-price-monitor"
+  github_token: "${UPDATE_GITHUB_TOKEN:-}"
+  check_interval: 0
+  proxy: "${UPDATE_PROXY:-}"
+  auto_download: false
+  auto_restart: true
+  backup_dir: "./data/backups"
+  release_asset_pattern: "price-monitor-{version}.tar.gz"

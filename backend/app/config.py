@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.getenv('APP_ROOT', str(Path(__file__).resolve().parents[2]))).resolve()
 load_dotenv(ROOT / '.env')
 
 DATABASE_URL = os.environ['DATABASE_URL']

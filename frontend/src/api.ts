@@ -17,6 +17,12 @@ export const auth = reactive<{ user: User | null; csrf: string; initialized: boo
   csrf: '',
   initialized: false,
 })
+export const appVersion = reactive({ value: '' })
+
+export async function loadVersion(options: RequestInit = {}) {
+  const result = await api<{ version: string }>('/version', options)
+  appVersion.value = result.version
+}
 
 export class ApiError extends Error {
   constructor(

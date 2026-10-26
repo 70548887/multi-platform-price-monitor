@@ -32,6 +32,10 @@ from .operations import platform_operation
 from .rule_config import validate_rule_config
 from .platform_registry import (PLATFORM_TYPES, adapter_info, adapter_default_rule,
                                 adapter_supported, require_supported, validate_adapter_rule)
+from .update_api import router as update_router
+from .update_common import UpdateError
+from .update_service import maintenance_active
+from .version import VERSION
 
 STARTED = time.monotonic()
 
@@ -44,6 +48,7 @@ async def lifespan(app):
         Base.metadata.create_all(connection)
         connection.execute(text('ALTER TABLE platforms ADD COLUMN IF NOT EXISTS account_fingerprint VARCHAR(64)'))
         connection.execute(text("ALTER TABLE platforms ADD COLUMN IF NOT EXISTS platform_type VARCHAR(40) NOT NULL DEFAULT 'yile'"))
+        connection.execute(text("ALTER TABLE update_runs ADD COLUMN IF NOT EXISTS repository VARCHAR(240) NOT NULL DEFAULT ''"))
     with SessionLocal() as db:
         if db.scalar(select(User.id).limit(1)) is None:
             if len(config.ADMIN_PASSWORD) < 12:
@@ -53,7 +58,7 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title='多平台价格监控', version='1.0.0', lifespan=lifespan)
+app = FastAPI(title='多平台价格监控', version=VERSION, lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=config.SESSION_SECRET or 'unconfigured-startup-will-fail',
                    session_cookie='price_monitor_session', https_only=config.COOKIE_SECURE,
                    same_site='strict', max_age=86400)
@@ -61,12 +66,23 @@ app.add_middleware(SessionMiddleware, secret_key=config.SESSION_SECRET or 'uncon
 
 @app.middleware('http')
 async def response_headers(request, call_next):
+    if (request.url.path.startswith('/api/') and request.method not in ('GET', 'HEAD', 'OPTIONS')
+            and request.url.path not in ('/api/auth/login', '/api/auth/logout') and maintenance_active()):
+        return JSONResponse({'detail': '系统正在升级，请稍后再试。'}, status_code=503, headers={'Retry-After': '30'})
     response = await call_next(request)
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Referrer-Policy'] = 'same-origin'
     if request.url.path.startswith('/api/'):
         response.headers['Cache-Control'] = 'no-store'
     return response
+
+
+@app.exception_handler(UpdateError)
+async def update_error(request, exc):
+    return JSONResponse({'detail': exc.message, 'error_code': exc.code}, status_code=exc.status_code)
+
+
+app.include_router(update_router)
 
 
 def require(db, model, identifier):

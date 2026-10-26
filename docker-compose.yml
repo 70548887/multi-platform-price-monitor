@@ -4,6 +4,9 @@ x-backend: &backend
   build:
     context: .
     dockerfile: backend/Dockerfile
+    args:
+      APP_UID: ${APP_UID:-10001}
+      APP_GID: ${APP_GID:-10001}
   environment: &backend-env
     DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-price_monitor}:${POSTGRES_PASSWORD:?Run python scripts/init_env.py}@db:5432/${POSTGRES_DB:-price_monitor}
     REDIS_URL: redis://redis:6379/0
@@ -11,10 +14,16 @@ x-backend: &backend
     ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Run python scripts/init_env.py}
     SESSION_SECRET: ${SESSION_SECRET:?Run python scripts/init_env.py}
     ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Run python scripts/init_env.py}
+    UPDATE_GITHUB_TOKEN: ${UPDATE_GITHUB_TOKEN:-}
+    UPDATE_PROXY: ${UPDATE_PROXY:-}
     COOKIE_SECURE: ${COOKIE_SECURE:-false}
     TZ: Asia/Shanghai
   restart: unless-stopped
   init: true
+  user: "${APP_UID:-10001}:${APP_GID:-10001}"
+  volumes:
+    - ./data/update:/app/data/update
+    - ./config/update.yaml:/app/config/update.yaml:ro
   depends_on:
     db:
       condition: service_healthy

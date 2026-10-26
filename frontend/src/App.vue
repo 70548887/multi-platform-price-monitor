@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, auth, json } from './api'
+import { api, auth, json, appVersion, loadVersion } from './api'
 import Icon from './components/Icon.vue'
 const route = useRoute(),
   router = useRouter(),
@@ -30,6 +30,14 @@ watch(
   () => {
     mobile.value = false
   },
+)
+watch(
+  () => auth.user?.id,
+  (id) => {
+    if (id) loadVersion().catch(() => {})
+    else appVersion.value = ''
+  },
+  { immediate: true },
 )
 watch(
   () => auth.user,
@@ -74,11 +82,16 @@ async function logout() {
           <RouterLink to="/users" :class="{ active: route.path === '/users' }"
             ><Icon name="users" /><span>成员管理</span></RouterLink
           >
+          <RouterLink to="/settings/update" :class="{ active: route.path === '/settings/update' }"
+            ><Icon name="refresh" /><span>系统更新</span></RouterLink
+          >
         </nav></template
       >
       <div class="sidebar-bottom">
         <div class="system-info">
-          <span class="live-dot"></span>小时级价格观测<span class="version-label">V1.0</span>
+          <span class="live-dot"></span>小时级价格观测<span class="version-label">{{
+            appVersion.value ? `v${appVersion.value}` : '版本待读取'
+          }}</span>
         </div>
         <div class="profile">
           <span class="avatar">{{ auth.user?.username?.slice(0, 1).toUpperCase() ?? 'U' }}</span>

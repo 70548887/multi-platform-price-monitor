@@ -1,10 +1,11 @@
 param(
-    [ValidateSet('services', 'start', 'restart-app', 'stop', 'status')]
+    [ValidateSet('services', 'start', 'stop-app', 'restart-app', 'stop', 'status')]
     [string]$Action = 'status',
     [int]$ApiPort = 28671,
     [int]$WebPort = 28672,
     [int]$PostgresPort = 55432,
     [int]$RedisPort = 56379,
+    [string]$PythonExe = '',
     [string]$PostgresBin = 'C:\Program Files\PostgreSQL\16\bin',
     [string]$RedisExe = 'D:\phpstudy_pro\Extensions\redis3.0.504\redis-server.exe'
 )
@@ -54,6 +55,35 @@ function Add-Record([string]$Label, $StartedProcess) {
         started_at = $StartedProcess.StartTime.ToUniversalTime().ToString('o')
     }
     Save-Records
+}
+
+function Stop-OwnedApp([string]$Label) {
+    $ownedProcess = Get-OwnedProcess $Label
+    if (-not $ownedProcess) { return }
+    # A Windows venv launcher may own a Python child which holds the listener.
+    # Resolve descendants only after the recorded parent identity is verified.
+    $tree = [Collections.Generic.List[object]]::new()
+    $pending = [Collections.Generic.Queue[object]]::new()
+    $pending.Enqueue($ownedProcess)
+    while ($pending.Count -gt 0) {
+        $parent = $pending.Dequeue()
+        $tree.Add(@{ Id = $parent.Id; StartedAt = $parent.StartTime.ToUniversalTime(); Path = $parent.Path })
+        $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($parent.Id)" -ErrorAction SilentlyContinue
+        foreach ($child in $children) {
+            $candidate = Get-Process -Id $child.ProcessId -ErrorAction SilentlyContinue
+            if ($candidate -and $candidate.StartTime.ToUniversalTime() -ge $parent.StartTime.ToUniversalTime()) {
+                $pending.Enqueue($candidate)
+            }
+        }
+    }
+    for ($index = $tree.Count - 1; $index -ge 0; $index--) {
+        $record = $tree[$index]
+        $candidate = Get-Process -Id $record.Id -ErrorAction SilentlyContinue
+        if ($candidate -and $candidate.Path -eq $record.Path -and $candidate.StartTime.ToUniversalTime() -eq $record.StartedAt) {
+            Stop-Process -Id $candidate.Id
+            $candidate.WaitForExit(10000) | Out-Null
+        }
+    }
 }
 
 function Assert-FreePort([int]$Port) {
@@ -109,7 +139,7 @@ if ($Action -eq 'stop') {
                     Stop-Process -Id $ownedProcess.Id
                 }
             } else {
-                Stop-Process -Id $ownedProcess.Id
+                Stop-OwnedApp $label
             }
         }
         $records.Remove($label)
@@ -119,13 +149,13 @@ if ($Action -eq 'stop') {
     exit 0
 }
 
-if ($Action -eq 'restart-app') {
+if ($Action -eq 'restart-app' -or $Action -eq 'stop-app') {
     foreach ($label in @('web', 'beat', 'worker', 'api')) {
-        $ownedProcess = Get-OwnedProcess $label
-        if ($ownedProcess) { Stop-Process -Id $ownedProcess.Id }
+        Stop-OwnedApp $label
         $records.Remove($label)
         Save-Records
     }
+    if ($Action -eq 'stop-app') { exit 0 }
     $Action = 'start'
 }
 
@@ -199,16 +229,16 @@ if ($Action -eq 'services') {
     exit 0
 }
 
-$pythonExe = Join-Path $repoRoot '.venv\Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $pythonExe)) { throw 'Create the root .venv and install backend/requirements.txt first.' }
+$appPythonExe = if ($PythonExe) { [IO.Path]::GetFullPath($PythonExe) } else { Join-Path $repoRoot '.venv\Scripts\python.exe' }
+if (-not (Test-Path -LiteralPath $appPythonExe)) { throw 'Create the root .venv or provide -PythonExe and install backend/requirements.txt first.' }
 $nodeExecutable = (Get-Command node -ErrorAction Stop).Source
 $viteEntry = Join-Path $repoRoot 'frontend\node_modules\vite\bin\vite.js'
 if (-not (Test-Path -LiteralPath $viteEntry)) { throw 'Run npm ci in frontend first.' }
 if (-not (Get-OwnedProcess 'api')) { Assert-FreePort $ApiPort }
-Start-Owned 'api' $pythonExe @('-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', "$ApiPort") (Join-Path $repoRoot 'backend')
+Start-Owned 'api' $appPythonExe @('-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', "$ApiPort") (Join-Path $repoRoot 'backend')
 Wait-Port $ApiPort 'API'
-Start-Owned 'worker' $pythonExe @('-m', 'celery', '-A', 'app.tasks:celery_app', 'worker', '--pool=solo', '--concurrency=1', '--loglevel=info') (Join-Path $repoRoot 'backend')
-Start-Owned 'beat' $pythonExe @('-m', 'celery', '-A', 'app.tasks:celery_app', 'beat', '--loglevel=info', '--max-interval=30', '--schedule', ('"' + (Join-Path $runtimeRoot 'celerybeat-schedule') + '"')) (Join-Path $repoRoot 'backend')
+Start-Owned 'worker' $appPythonExe @('-m', 'celery', '-A', 'app.tasks:celery_app', 'worker', '--pool=solo', '--concurrency=1', '--loglevel=info') (Join-Path $repoRoot 'backend')
+Start-Owned 'beat' $appPythonExe @('-m', 'celery', '-A', 'app.tasks:celery_app', 'beat', '--loglevel=info', '--max-interval=30', '--schedule', ('"' + (Join-Path $runtimeRoot 'celerybeat-schedule') + '"')) (Join-Path $repoRoot 'backend')
 if (-not (Get-OwnedProcess 'web')) { Assert-FreePort $WebPort }
 Start-Owned 'web' $nodeExecutable @(('"' + $viteEntry + '"'), '--host', '127.0.0.1', '--port', "$WebPort", '--strictPort') (Join-Path $repoRoot 'frontend')
 Wait-Port $WebPort 'Website'
