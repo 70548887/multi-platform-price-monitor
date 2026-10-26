@@ -122,6 +122,31 @@ Linux/Docker 部署运行：
 bash scripts/update_host.sh --mode compose
 ```
 
+宝塔面板使用 Docker 管理器时，按 Linux/Docker 模式运行 updater。API 容器用户和 updater 用户必须一致，并且该用户需要执行 Docker Compose 的权限：
+
+```bash
+export APP_UID=$(id -u www)
+export APP_GID=$(id -g www)
+mkdir -p data/update data/backups
+chown -R "$APP_UID:$APP_GID" data/update data/backups
+usermod -aG docker www
+```
+
+如果使用宝塔 Supervisor，可将 updater 配置为常驻进程：
+
+```ini
+[program:price-monitor-updater]
+command=/bin/bash /www/wwwroot/price-monitor/scripts/update_host.sh
+directory=/www/wwwroot/price-monitor
+user=www
+autostart=true
+autorestart=true
+stopasgroup=true
+killasgroup=true
+```
+
+当前宿主机 updater 的 `native` 模式用于 Windows 本机进程；Linux 宝塔的自动应用链路使用 Docker Compose。宝塔直接托管 Uvicorn、Celery 和 Nginx 的非 Docker 组合需要把停止和启动命令接入宿主机服务管理器后再启用自动应用。
+
 Docker 部署需让 API 容器用户与宿主机更新器用户使用相同的 `APP_UID`、`APP_GID`，并提前创建可写目录：
 
 ```bash
