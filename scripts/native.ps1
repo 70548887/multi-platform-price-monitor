@@ -42,7 +42,11 @@ function Get-OwnedProcess([string]$Label) {
     $startedAt = $ownedProcess.StartTime.ToUniversalTime().ToString('o')
     $recordStartedAt = ([datetime]$record.started_at).ToUniversalTime().ToString('o')
     if ($ownedProcess.Path -ne $record.executable -or $startedAt -ne $recordStartedAt) {
-        throw "PID ownership check failed for $Label; the PID was reused. No process was stopped."
+        # A PID can be reused after a child process exits. Treat the record as
+        # stale and never touch the unrelated process; callers may safely
+        # replace the stale record during the next start.
+        Write-Warning "PID ownership check failed for $Label; the PID was reused. The unrelated process was left untouched."
+        return $null
     }
     return $ownedProcess
 }
