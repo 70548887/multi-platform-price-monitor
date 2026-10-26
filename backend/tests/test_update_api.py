@@ -17,6 +17,7 @@ from app.update_common import UpdateError, read_signed_json, sign_document, writ
 from app.update_config import UpdateConfig
 from app.update_github import DownloadResult, ReleaseInfo
 from app.version import VERSION
+from dataclasses import replace
 
 
 @pytest.fixture(autouse=True)
@@ -166,3 +167,80 @@ def test_unsigned_host_results_are_ignored_and_orphan_download_is_failed(admin_c
 def test_zero_interval_no_github_calls(monkeypatch):
     monkeypatch.setattr(service, 'GitHubReleaseClient', lambda *_: (_ for _ in ()).throw(AssertionError('network')))
     assert service.automatic_check() == {'skipped': True}
+
+
+def test_bad_update_configuration_does_not_pause_business_without_real_marker(admin_client, monkeypatch, isolated_updater):
+    monkeypatch.setattr(service.config, 'ROOT', isolated_updater.root)
+    def invalid_settings():
+        raise UpdateError('invalid_update_config', '更新配置错误')
+    monkeypatch.setattr(service, 'update_config', invalid_settings)
+    assert service.maintenance_active() is False
+    response = admin_client.post('/api/platforms', json={'name': '配置错误不影响采集管理', 'base_url': 'https://source.example'})
+    assert response.status_code == 200, response.text
+    write_signed_json(isolated_updater.runtime_dir / 'maintenance.json', {'run_id': 100}, service.config.SESSION_SECRET)
+    assert service.maintenance_active() is True
+    assert admin_client.post('/api/platforms', json={'name': '维护仍阻断', 'base_url': 'https://source.example'}).status_code == 503
+
+
+def test_missing_job_recovers_exact_committed_intent_after_configuration_change(admin_client, db, monkeypatch, isolated_updater):
+    identifier = ready_run(admin_client, monkeypatch)
+    response = admin_client.post('/api/update/apply', json={'run_id': identifier})
+    assert response.status_code == 202
+    job = isolated_updater.runtime_dir / 'jobs' / f'{identifier}.json'
+    original = read_signed_json(job, service.config.SESSION_SECRET)
+    job.unlink()
+    db.expire_all()
+    run = db.get(UpdateRun, identifier)
+    assert run.pending_job == original
+    run.updated_at = utcnow()-timedelta(minutes=2)
+    db.commit()
+    monkeypatch.setattr(service, 'update_config', lambda: replace(isolated_updater, github_repo='other-repository', auto_restart=False))
+    service.recover_interrupted(db)
+    recovered = read_signed_json(job, service.config.SESSION_SECRET)
+    assert recovered == original
+    assert recovered['auto_restart'] is True
+    assert recovered['repository'] == '70548887/multi-platform-price-monitor'
+
+
+def test_legacy_orphan_without_committed_intent_fails_without_guessing(db, isolated_updater):
+    run = UpdateRun(action='apply', current_version=VERSION, target_version='2.0.0', status='awaiting_host',
+                    updated_at=utcnow()-timedelta(minutes=2))
+    db.add(run)
+    db.commit()
+    service.recover_interrupted(db)
+    assert run.status == 'failed'
+    assert not (isolated_updater.runtime_dir / 'jobs' / f'{run.id}.json').exists()
+
+
+def test_download_rejects_changed_repository_before_scheduling(admin_client, monkeypatch, isolated_updater):
+    monkeypatch.setattr(service, 'GitHubReleaseClient', FakeGitHub)
+    identifier = admin_client.post('/api/update/check', json={}).json()['id']
+    monkeypatch.setattr(service, 'update_config', lambda: replace(isolated_updater, github_repo='other-repository'))
+    response = admin_client.post('/api/update/download', json={'run_id': identifier})
+    assert response.status_code == 409
+    assert response.json()['error_code'] == 'UPDATE_REPOSITORY_CHANGED'
+
+
+def test_background_download_rechecks_repository_after_response(admin_client, db, monkeypatch, isolated_updater):
+    import asyncio
+    monkeypatch.setattr(service, 'GitHubReleaseClient', FakeGitHub)
+    identifier = admin_client.post('/api/update/check', json={}).json()['id']
+    actor = db.scalar(select(User).where(User.username == 'test-admin'))
+    _, lease = service.begin_download(identifier, actor)
+    monkeypatch.setattr(service, 'update_config', lambda: replace(isolated_updater, github_repo='other-repository'))
+    asyncio.run(service.download_run(identifier, lease))
+    db.expire_all()
+    assert db.get(UpdateRun, identifier).error_code == 'UPDATE_REPOSITORY_CHANGED'
+    assert not (isolated_updater.runtime_dir / 'packages').exists()
+
+
+def test_new_update_lock_can_recover_old_orphan_before_next_check(admin_client, db, monkeypatch):
+    row = UpdateRun(action='download', current_version=VERSION, status='downloading', updated_at=utcnow()-timedelta(minutes=5))
+    db.add(row)
+    db.commit()
+    monkeypatch.setattr(service, 'GitHubReleaseClient', FakeGitHub)
+    response = admin_client.post('/api/update/check', json={})
+    assert response.status_code == 200
+    assert response.json()['status'] == 'available'
+    db.expire_all()
+    assert db.get(UpdateRun, row.id).status == 'failed'

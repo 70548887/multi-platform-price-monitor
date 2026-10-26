@@ -47,6 +47,8 @@ def test_environment_overrides_literal_yaml_and_empty_value_disables_secret(tmp_
     'update:\n  proxy: "http://proxy.example:xx"', 'update:\n  release_asset_pattern: "../{version}.tar.gz"',
     'update:\n  release_asset_pattern: "{other}-{version}.tar.gz"', 'update:\n  backup_dir: "."',
     'update:\n  backup_dir: "${HOME}"', 'update: [broken',
+    'update:\n  backup_dir: "../private"', 'update:\n  backup_dir: "data/update"',
+    'update:\n  backup_dir: "data/update/backup"', 'update:\n  backup_dir: "data"',
 ])
 def test_bad_update_config_has_no_untrusted_values_in_errors(tmp_path, value):
     config_file(tmp_path, value)

@@ -5,7 +5,9 @@
 set -eu
 updater_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 umask 077
-if [ -x "$updater_root/.venv/bin/python" ]; then
+if [ -x "$updater_root/data/update/host-env/bin/python" ]; then
+    updater_python="$updater_root/data/update/host-env/bin/python"
+elif [ -x "$updater_root/.venv/bin/python" ]; then
     updater_python="$updater_root/.venv/bin/python"
 else
     updater_python=python3

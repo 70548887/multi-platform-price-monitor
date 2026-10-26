@@ -200,6 +200,15 @@ class Fans8Collector(Xiaohong66Collector):
         if host != "fans8.top" and host not in explicit:
             raise CollectorError("Source host requires an explicit allowed_hosts entry")
 
+    async def _validate_host(self, url: str) -> None:
+        self._validate_url_shape(url)
+        # The fixed adapter origin is already trusted, like the Yile origin.
+        # Proxy CONNECT resolves it at the proxy; requiring local DNS first
+        # would prevent that route from working when local DNS is unavailable.
+        if str(urlsplit(url).hostname or '').lower().rstrip('.') == 'fans8.top':
+            return
+        await super()._validate_host(url)
+
     async def _get(self, path: str, data: dict[str, Any]) -> Any:
         if not self._token and not self._session.cookies:
             raise AuthExpired("Source account requires a login session")
@@ -224,8 +233,10 @@ class Fans8Collector(Xiaohong66Collector):
             try:
                 response = await self._client.get(url, params=data, headers=headers, follow_redirects=False,
                                                   timeout=float(self.rule.get("timeout_seconds", 30)))
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProxyError) as exc:
                 if attempt + 1 >= attempts:
+                    if isinstance(exc, httpx.ProxyError):
+                        raise CollectorError("Source proxy request failed after limited retries") from None
                     raise CollectorError("Source network request failed after limited retries") from None
                 await self._sleep(self._retry_delay(None, attempt))
                 continue

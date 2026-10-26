@@ -34,6 +34,7 @@ class Platform(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     interval_seconds: Mapped[int] = mapped_column(Integer, default=3600)
     request_interval: Mapped[Decimal] = mapped_column(Numeric, default=Decimal('1'))
+    proxy_route: Mapped[str] = mapped_column(String(16), default='direct', server_default='direct')
     encrypted_session: Mapped[str | None] = mapped_column(Text, nullable=True)
     account_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     auth_status: Mapped[str] = mapped_column(String(24), default='missing')
@@ -56,6 +57,16 @@ class Rule(Base):
     tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     test_ok: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SystemNetworkSettings(Base):
+    __tablename__ = 'system_network_settings'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tunnel_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    tunnel_encrypted_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    overseas_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    overseas_encrypted_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class CollectionRun(Base):
@@ -189,6 +200,7 @@ class UpdateRun(Base):
     target_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     tag: Mapped[str | None] = mapped_column(String(40), nullable=True)
     repository: Mapped[str] = mapped_column(String(240), default='')
+    pending_job: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(32), default='checking', index=True)
     message: Mapped[str] = mapped_column(Text, default='')
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)

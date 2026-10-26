@@ -1,0 +1,22 @@
+# Copy to /etc/systemd/system/price-monitor-updater.service after replacing
+# User, Group, WorkingDirectory and ExecStart with the actual deployment paths.
+[Unit]
+Description=PriceScope host updater
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=price-monitor
+Group=price-monitor
+WorkingDirectory=/www/wwwroot/price-monitor
+ExecStart=/bin/bash /www/wwwroot/price-monitor/scripts/update_host.sh --mode compose
+Restart=on-failure
+RestartSec=10
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

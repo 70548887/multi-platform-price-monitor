@@ -20,6 +20,7 @@ from .security import decrypt_session
 from .services import add_event, persist_page
 from .limits import PlatformLease
 from .platform_registry import adapter_supported
+from .network_settings import get_platform_proxy
 
 celery_app = Celery('price_monitor', broker=config.REDIS_URL, backend=config.REDIS_URL)
 celery_app.conf.update(
@@ -143,8 +144,9 @@ async def execute_run(run_id: int):
                 lease = PlatformLease(rc, platform.id, platform.request_interval, owner=owner, heartbeat=heartbeat)
                 await lease.start()
                 source_class = Xiaohong66Collector if platform.adapter == 'xiaohong66' else Fans8Collector
+                proxy_options = {'proxy_url': get_platform_proxy(db, platform)} if getattr(platform, 'proxy_route', 'direct') != 'direct' else {}
                 collector = source_class(platform.base_url, decrypt_session(platform.encrypted_session), rule.config,
-                                               request_gate=lease.gate, sleep=lease.sleep)
+                                               request_gate=lease.gate, sleep=lease.sleep, **proxy_options)
                 async for page in collector.iter_pages():
                     lease.renew()
                     persist_page(db, run, page)

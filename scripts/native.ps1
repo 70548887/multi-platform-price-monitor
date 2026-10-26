@@ -233,7 +233,15 @@ if ($Action -eq 'services') {
     exit 0
 }
 
-$appPythonExe = if ($PythonExe) { [IO.Path]::GetFullPath($PythonExe) } else { Join-Path $repoRoot '.venv\Scripts\python.exe' }
+$defaultPythonExe = Join-Path $repoRoot '.venv\Scripts\python.exe'
+$activationPath = Join-Path $repoRoot 'data\update\activation.json'
+if (-not $PythonExe -and (Test-Path -LiteralPath $activationPath)) {
+    $resolverPython = if (Test-Path -LiteralPath $defaultPythonExe) { $defaultPythonExe } else { (Get-Command python -ErrorAction Stop).Source }
+    $resolvedPython = & $resolverPython (Join-Path $PSScriptRoot 'active_python.py') --root $repoRoot
+    if ($LASTEXITCODE -ne 0) { throw 'The signed application runtime activation could not be verified.' }
+    $PythonExe = ([string]$resolvedPython).Trim()
+}
+$appPythonExe = if ($PythonExe) { [IO.Path]::GetFullPath($PythonExe) } else { $defaultPythonExe }
 if (-not (Test-Path -LiteralPath $appPythonExe)) { throw 'Create the root .venv or provide -PythonExe and install backend/requirements.txt first.' }
 $nodeExecutable = (Get-Command node -ErrorAction Stop).Source
 $viteEntry = Join-Path $repoRoot 'frontend\node_modules\vite\bin\vite.js'

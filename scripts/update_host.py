@@ -22,7 +22,7 @@ import sys
 import time
 from typing import Callable
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 import uuid
 
 
@@ -162,7 +162,7 @@ class HostProbe:
         self.origin = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
         self.secret = secret
         # Never send a host proof, administrator state or loopback traffic to a proxy.
-        self.opener = build_opener(ProxyHandler({}))
+        self.opener = build_opener(ProxyHandler({}), NoHostRedirect())
 
     def __call__(self, purpose: str, run_id: int) -> dict:
         payload = {"purpose": purpose, "run_id": run_id, "at": utcnow()}
@@ -178,6 +178,12 @@ class HostProbe:
         if not isinstance(data, dict):
             raise UpdateError("HOST_PROBE_FAILED", "应用健康检查响应异常")
         return data
+
+
+class NoHostRedirect(HTTPRedirectHandler):
+    """A signed local proof must never leave the configured loopback origin."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class HostUpdater:
@@ -293,9 +299,38 @@ class HostUpdater:
         try:
             health = self.probe("health", job["run_id"])
             return (health.get("status") == "ok" and health.get("version") == version
-                    and all(health.get(key) is True for key in ("worker", "beat", "database", "redis")))
+                    and all(health.get(key) is True for key in ("worker", "beat", "database", "redis"))
+                    and self._services_healthy())
         except Exception:
             return False
+
+    def _services_healthy(self) -> bool:
+        """Check actual managed processes/containers, not a stale Redis timestamp."""
+        if self.mode == "native":
+            path = str(self.root / 'scripts/native.ps1').replace("'", "''")
+            command = f"$ErrorActionPreference='Stop'; $WarningPreference='SilentlyContinue'; & '{path}' -Action status | ConvertTo-Json -Compress"
+            output = self.runner(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                                 cwd=self.root, timeout=30)
+            rows = json.loads(output)
+            if not isinstance(rows, list):
+                return False
+            by_service = {row.get('service'): row for row in rows if isinstance(row, dict)}
+            return all(by_service.get(name, {}).get('running') is True
+                       and type(by_service[name].get('pid')) is int and by_service[name]['pid'] > 0
+                       for name in APP_SERVICES)
+        output = self.runner(self._compose(self.root) + ["ps", "--all", "--format", "json", *APP_SERVICES],
+                             cwd=self.root, timeout=30)
+        try:
+            rows = json.loads(output)
+            if isinstance(rows, dict):
+                rows = [rows]
+        except json.JSONDecodeError:
+            rows = [json.loads(line) for line in output.splitlines() if line.strip()]
+        if not isinstance(rows, list) or len(rows) != len(APP_SERVICES):
+            return False
+        return {row.get('Service') for row in rows if isinstance(row, dict)} == set(APP_SERVICES) and all(
+            isinstance(row, dict) and row.get('State') == 'running' and row.get('Health') == 'healthy'
+            for row in rows)
 
     def _wait_health(self, job: dict, version: str) -> None:
         deadline = time.monotonic() + self.health_timeout
@@ -496,22 +531,62 @@ class HostUpdater:
         self._restore(job, snapshot)
         self._start(job, snapshot["activation"] if self.mode == "native" else {"images": snapshot["images"]})
         self._wait_health(job, snapshot["version"])
-        self._clear_maintenance(job)
-        self.journal_path(job["run_id"]).unlink(missing_ok=True)
-        return self.result(job, "rolled_back", "complete", 100, message, backup_id=snapshot["backup_id"], backup_version=snapshot["version"], version=snapshot["version"])
+        return self._complete(job, snapshot, "rolled_back", message, snapshot["version"])
 
     def _finish(self, job: dict, snapshot: dict, activation: dict) -> dict:
         if self.mode == "native":
             write_signed_json(self.data_dir / "activation.json", activation, self.secret)
+        final_status = "rolled_back" if job["action"] == "rollback" else "succeeded"
+        return self._complete(job, snapshot, final_status, "指定版本已启动且全部健康检查通过", job["target_version"])
+
+    def _complete(self, job: dict, snapshot: dict, status: str, message: str, version: str) -> dict:
+        # Record verified completion before dropping the recovery journal. A
+        # crash at any later instruction may only finish cleanup, never apply
+        # this job again or mark the already healthy version as failed.
+        completion = {"status": status, "message": message, "version": version}
+        self.journal(job, "completed", snapshot, completion=completion)
+        return self._publish_completion(job, snapshot, completion)
+
+    def _publish_completion(self, job: dict, snapshot: dict, completion: dict) -> dict:
+        status, version = completion.get('status'), completion.get('version')
+        if status not in {'succeeded', 'rolled_back'}:
+            raise UpdateError('INVALID_COMPLETION', '更新终态记录无效')
+        strict_semver(version)
+        if status == 'succeeded' and (job['action'] != 'apply' or version != job['target_version']):
+            raise UpdateError('INVALID_COMPLETION', '更新终态版本与任务不一致')
+        if status == 'rolled_back' and version not in {job['current_version'], job['target_version']}:
+            raise UpdateError('INVALID_COMPLETION', '回滚终态版本与任务不一致')
+        output = self.result(job, status, "complete", 100, "指定版本已启动且全部健康检查通过",
+                             backup_id=snapshot["backup_id"], backup_version=snapshot["version"], version=version)
         self._clear_maintenance(job)
         self.journal_path(job["run_id"]).unlink(missing_ok=True)
-        final_status = "rolled_back" if job["action"] == "rollback" else "succeeded"
-        return self.result(job, final_status, "complete", 100, "指定版本已启动且全部健康检查通过", backup_id=snapshot["backup_id"], backup_version=snapshot["version"])
+        return output
+
+    def _finished_result(self, job: dict) -> dict | None:
+        path = self.data_dir / 'results' / f"{job['run_id']}.json"
+        if not path.is_file():
+            return None
+        output = read_signed_json(path, self.secret)
+        if output.get('run_id') != job['run_id'] or output.get('target_version') != job['target_version']:
+            return None
+        state, version = output.get('status'), output.get('version')
+        if state == 'succeeded' and job['action'] == 'apply' and version == job['target_version']:
+            return output
+        if state == 'rolled_back' and version in {job['current_version'], job['target_version']}:
+            return output
+        return None
 
     def _resume(self, record: dict) -> dict:
         job, snapshot = record["job"], record["snapshot"]
         self.validate_job(job, f"{job['run_id']}.json")
         self.active_run_id = job["run_id"]
+        finished = self._finished_result(job)
+        if finished:
+            self._clear_maintenance(job)
+            self.journal_path(job['run_id']).unlink(missing_ok=True)
+            return finished
+        if record['phase'] == 'completed':
+            return self._publish_completion(job, snapshot, record['completion'])
         if record["phase"] == "applied" and not job["auto_restart"]:
             if self._healthy(job, job["target_version"]):
                 return self._finish(job, snapshot, record["activation"])
@@ -616,11 +691,28 @@ class HostUpdater:
                 self.phase = "idle"
                 self.heartbeat()
         for path in sorted((self.data_dir / "jobs").glob("[0-9]*.json")):
-            reject_links(path, self.root)
-            job = self.validate_job(read_signed_json(path, self.secret), path.name)
-            output = self.data_dir / "results" / path.name
-            if output.is_file() and read_signed_json(output, self.secret).get("status") in TERMINAL_STATES:
+            try:
+                reject_links(path, self.root)
+                job = self.validate_job(read_signed_json(path, self.secret), path.name)
+            except (UpdateError, OSError, ValueError, TypeError):
+                # Bad queue input must not stop the daemon or starve valid
+                # later jobs. Do not trust its payload or echo its contents.
+                rejected = self.data_dir / 'rejected_jobs'
+                reject_links(rejected, self.root)
+                private_directory(rejected)
+                path.rename(rejected / (path.name + '.' + uuid.uuid4().hex))
+                if re.fullmatch(r'[1-9][0-9]{0,17}\.json', path.name):
+                    write_signed_json(self.data_dir / 'results' / path.name,
+                                      {'protocol': 1, 'run_id': int(path.stem), 'status': 'failed',
+                                       'updated_at': utcnow(), 'error_code': 'INVALID_HOST_JOB',
+                                       'message': '更新任务签名或内容无效，已隔离'}, self.secret)
                 continue
+            output = self.data_dir / "results" / path.name
+            if output.is_file():
+                previous = read_signed_json(output, self.secret)
+                if previous.get('run_id') == job['run_id'] and previous.get('status') in TERMINAL_STATES:
+                    if previous.get('error_code') == 'INVALID_HOST_JOB' or previous.get('target_version') == job['target_version']:
+                        continue
             return self.process_job(job)
         return None
 
@@ -642,7 +734,12 @@ def main() -> int:
     values = read_env(args.root / ".env")
     secret = os.environ.get("SESSION_SECRET") or values.get("SESSION_SECRET", "")
     try:
-        updater = HostUpdater(args.root, args.data_dir or args.root / "data/update", args.backup_dir or args.root / "data/backups",
+        try:
+            from app.update_config import load_update_config
+        except ModuleNotFoundError:
+            raise UpdateError('HOST_CONFIG_DEPENDENCY', '宿主机更新器需要安装配置读取依赖 PyYAML') from None
+        settings = load_update_config(root=args.root, environ={**values, **os.environ})
+        updater = HostUpdater(args.root, args.data_dir or settings.runtime_dir, args.backup_dir or settings.backup_dir,
                               mode=args.mode, secret=secret, probe=HostProbe(args.health_url, secret),
                               drain_timeout=args.drain_timeout, health_timeout=args.health_timeout)
         with process_lock(updater.data_dir / "host.lock"):

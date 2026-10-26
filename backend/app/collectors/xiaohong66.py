@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from http.cookiejar import Cookie
 from typing import Any, AsyncIterator, Awaitable, Callable
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 
@@ -118,13 +118,29 @@ class Xiaohong66Collector:
         client: httpx.AsyncClient | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        proxy_url: str | None = None,
     ) -> None:
         self.rule = {**DEFAULT_RULE, **dict(rule or {})}
         self.base_url = base_url.rstrip("/")
         self._session = decode_session_envelope(token.strip(), self.base_url)
         self._request_origin = self._session.origin
         self._token = self._session.token
-        self._secrets = tuple(x for x in (self._token, *(cookie["value"] for cookie in self._session.cookies)) if x)
+        proxy_secrets: tuple[str, ...] = ()
+        if proxy_url is not None:
+            try:
+                proxy = urlsplit(proxy_url)
+                valid_proxy = (isinstance(proxy_url, str) and proxy.scheme in {"http", "https"}
+                               and proxy.hostname and proxy.port and proxy.path in {"", "/"}
+                               and not proxy.query and not proxy.fragment
+                               and not any(ord(char) < 32 or ord(char) == 127 for char in proxy_url))
+            except (ValueError, TypeError):
+                valid_proxy = False
+            if not valid_proxy:
+                raise CollectorError("Source proxy configuration is invalid") from None
+            if client is not None or transport is not None:
+                raise CollectorError("Source proxy cannot be combined with an injected HTTP client or transport")
+            proxy_secrets = tuple(x for x in (proxy_url, unquote(proxy.username or ""), unquote(proxy.password or "")) if x)
+        self._secrets = tuple(x for x in (self._token, *(cookie["value"] for cookie in self._session.cookies), *proxy_secrets) if x)
         self._request_gate = request_gate
         self._sleep = sleep
         self._validate_url_shape(self.base_url)
@@ -133,6 +149,7 @@ class Xiaohong66Collector:
             timeout=httpx.Timeout(float(self.rule.get("timeout_seconds", 30))),
             follow_redirects=False,
             transport=transport,
+            proxy=proxy_url,
             trust_env=False,
         )
         for cookie in self._session.cookies:
@@ -255,8 +272,10 @@ class Xiaohong66Collector:
                     follow_redirects=False,
                     timeout=float(self.rule.get("timeout_seconds", 30)),
                 )
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProxyError) as exc:
                 if attempt + 1 >= attempts:
+                    if isinstance(exc, httpx.ProxyError):
+                        raise CollectorError("Source proxy request failed after limited retries") from None
                     raise CollectorError("Source network request failed after limited retries") from None
                 await self._sleep(self._retry_delay(None, attempt))
                 continue

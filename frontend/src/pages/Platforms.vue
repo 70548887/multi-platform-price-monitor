@@ -40,6 +40,7 @@ const form = reactive({
   enabled: true,
   interval_seconds: 3600,
   request_interval: 1,
+  proxy_route: 'direct',
 })
 const admin = computed(() => auth.user?.role === 'admin')
 const filterTypes = computed(() => {
@@ -144,6 +145,7 @@ async function open(platform?: any) {
     enabled: platform?.enabled ?? true,
     interval_seconds: platform?.interval_seconds ?? 3600,
     request_interval: platform?.request_interval ?? 1,
+    proxy_route: platform?.proxy_route ?? 'direct',
   })
   previousDefaultUrl.value = selectedAdapter.value?.default_base_url ?? ''
   hasPublishedRules.value = false
@@ -256,6 +258,13 @@ function authLabel(value: string) {
     ] ?? value
   )
 }
+function proxyLabel(value: string | undefined) {
+  return (
+    ({ direct: '直连', tunnel: '隧道代理', overseas: '境外代理' } as Record<string, string>)[
+      value ?? 'direct'
+    ] ?? '待核对线路'
+  )
+}
 </script>
 <template>
   <div class="page-tools">
@@ -333,6 +342,9 @@ function authLabel(value: string) {
       </div>
       <div class="platform-detail">
         <span>采集账号</span><strong>{{ platform.account_label }}</strong>
+      </div>
+      <div class="platform-detail">
+        <span>采集线路</span><strong>{{ proxyLabel(platform.proxy_route) }}</strong>
       </div>
       <div class="platform-detail">
         <span>登录会话</span
@@ -516,6 +528,19 @@ function authLabel(value: string) {
           /><small>同平台所有任务共享限速</small></label
         >
       </div>
+      <label>
+        采集线路
+        <select v-model="form.proxy_route" :disabled="saving">
+          <option value="direct">直连 · 使用服务器出口</option>
+          <option value="tunnel">隧道代理</option>
+          <option value="overseas">境外代理</option>
+        </select>
+        <small
+          >按平台选择出口，代理地址在
+          <RouterLink to="/settings/network">系统设置</RouterLink>
+          中维护。所选代理未配置或停用时，需要先启用代理。</small
+        >
+      </label>
       <label class="checkbox-label"
         ><input
           v-model="form.enabled"

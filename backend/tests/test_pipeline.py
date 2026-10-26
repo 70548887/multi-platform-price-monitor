@@ -61,6 +61,8 @@ def isolated_database():
     with engine.begin() as connection:
         connection.execute(text('ALTER TABLE platforms ADD COLUMN IF NOT EXISTS account_fingerprint VARCHAR(64)'))
         connection.execute(text("ALTER TABLE platforms ADD COLUMN IF NOT EXISTS platform_type VARCHAR(40) NOT NULL DEFAULT 'yile'"))
+        connection.execute(text("ALTER TABLE platforms ADD COLUMN IF NOT EXISTS proxy_route VARCHAR(16) NOT NULL DEFAULT 'direct'"))
+        connection.execute(text("ALTER TABLE update_runs ADD COLUMN IF NOT EXISTS pending_job JSON NOT NULL DEFAULT '{}'::json"))
     yield
     engine.dispose()
 

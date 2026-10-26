@@ -95,6 +95,39 @@ class Runtime:
 
 
 class ConnectorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_proxy_route_validates_on_server_without_direct_source_request(self):
+        context = Context(settle=False)
+        browser = Browser(context)
+        uploads = []
+        output = io.StringIO()
+
+        class Chromium:
+            async def launch(self, **kwargs):
+                return browser
+
+        async def handler(request):
+            if request.url.path == '/api/auth/login':
+                return httpx.Response(200, json={'role': 'admin', 'csrf_token': 'fixture-csrf'})
+            if request.url.path == '/api/platforms':
+                return httpx.Response(200, json={'items': [{'id': 1, 'adapter': 'xiaohong66',
+                                                            'base_url': 'https://www.xiaohong66.com', 'proxy_route': 'overseas'}]})
+            self.assertEqual(request.url.path, '/api/platforms/1/session')
+            self.assertEqual(request.headers['X-CSRF-Token'], 'fixture-csrf')
+            uploads.append(json.loads(request.content)['token'])
+            return httpx.Response(200, json={'ok': True})
+
+        async def forbidden(*args, **kwargs):
+            self.fail('Proxy route must validate at the monitor server')
+
+        fake_http = types.SimpleNamespace(AsyncClient=lambda **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(handler), **kwargs))
+        fake_playwright = types.SimpleNamespace(TimeoutError=TimeoutError, async_playwright=lambda: Runtime(types.SimpleNamespace(chromium=Chromium())))
+        args = connector.parse_args(['--platform-id', '1'])
+        with patch.object(connector, 'pending_session_store', return_value=None), patch.object(connector, 'credentials', return_value=('fixture-admin', 'fixture-password')), patch.object(connector, 'validate_source_session', forbidden), contextlib.redirect_stdout(output):
+            await connector.connect(args, fake_http, fake_playwright)
+        self.assertEqual(len(uploads), 1)
+        self.assertTrue(browser.closed)
+        self.assertNotIn('unit-cookie-secret', output.getvalue())
+
     def test_default_monitor_uses_the_local_test_port(self):
         args = connector.parse_args(["--dry-run"])
         self.assertEqual(args.monitor_url, "http://127.0.0.1:28671")

@@ -9,14 +9,56 @@ import secrets
 import tempfile
 
 
+def prepare_update_config(root: Path) -> bool:
+    """Install the public template once, including in extracted Release installs."""
+    directory = root / "config"
+    source, target = directory / "update.example.yaml", directory / "update.yaml"
+    if directory.is_symlink() or source.is_symlink() or target.is_symlink():
+        raise ValueError("Update configuration paths cannot be symbolic links")
+    if target.exists():
+        if not target.is_file():
+            raise ValueError("config/update.yaml must be a regular file")
+        return False
+    if not source.is_file():
+        raise ValueError("config/update.example.yaml is missing from this installation")
+    descriptor, temporary = tempfile.mkstemp(prefix=".update-config-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(source.read_bytes())
+            stream.flush()
+            os.fsync(stream.fileno())
+        # This file contains public options and environment-variable references;
+        # containers must be able to read the mounted file as their own UID.
+        os.chmod(temporary, 0o644)
+        try:
+            # Link publishes complete bytes without overwriting a concurrent
+            # administrator's configuration; unlike replace it is exclusive.
+            os.link(temporary, target)
+        except FileExistsError:
+            if target.is_symlink() or not target.is_file():
+                raise ValueError("config/update.yaml must be a regular file") from None
+            return False
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[1] / ".env")
     parser.add_argument("--admin-username", default="admin")
     parser.add_argument("--quiet-secret", action="store_true", help="Do not print the generated admin password")
     parser.add_argument("--native", action="store_true", help="Use project-local PostgreSQL/Redis ports")
+    parser.add_argument("--prepare-config-only", action="store_true", help="Create missing public update config without changing existing secrets")
     args = parser.parse_args()
     output = args.output.resolve()
+    if args.prepare_config_only:
+        try:
+            created = prepare_update_config(output.parent)
+        except (OSError, ValueError) as error:
+            parser.exit(1, f"Update configuration initialization failed: {error}\n")
+        print("Created config/update.yaml" if created else "Kept existing config/update.yaml")
+        return 0
     if output.exists():
         parser.exit(1, f"Refusing to overwrite existing secrets: {output}\n")
     if not args.admin_username or any(c in args.admin_username for c in "\r\n=# "):
@@ -58,6 +100,8 @@ def main() -> int:
     else:
         print("Admin password was saved to .env and was not printed.")
     print("Keep .env securely; ENCRYPTION_KEY is required to recover platform sessions.")
+    if (output.parent / "config/update.example.yaml").is_file():
+        prepare_update_config(output.parent)
     return 0
 
 

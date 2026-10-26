@@ -79,6 +79,9 @@ async function logout() {
       <template v-if="auth.user?.role === 'admin'"
         ><div class="nav-caption second">团队设置</div>
         <nav>
+          <RouterLink to="/settings/network" :class="{ active: route.path === '/settings/network' }"
+            ><Icon name="settings" /><span>系统设置</span></RouterLink
+          >
           <RouterLink to="/users" :class="{ active: route.path === '/users' }"
             ><Icon name="users" /><span>成员管理</span></RouterLink
           >

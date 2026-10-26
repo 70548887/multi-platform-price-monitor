@@ -161,6 +161,9 @@ def validate_manifest(root: Path | str, expected_version: str | None = None, *, 
     if not isinstance(manifest, dict) or manifest.get("product") != "price-monitor":
         raise UpdateError("invalid_manifest", "更新包产品标识错误")
     version = strict_semver(manifest.get("version"))
+    if 'revision' in manifest and (not isinstance(manifest['revision'], str)
+            or not re.fullmatch(r'[0-9a-f]{40}', manifest['revision']) or manifest['revision'] == '0' * 40):
+        raise UpdateError('invalid_manifest', '更新包的 Git 提交标识无效')
     if expected_version is not None and version != strict_semver(expected_version):
         raise UpdateError("manifest_version_mismatch", "更新包版本与目标版本不一致")
     files = manifest.get("files")

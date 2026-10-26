@@ -135,11 +135,14 @@ def host_status(settings=None):
 def maintenance_active():
     """A signed durable marker blocks writes until the host completes recovery."""
     try:
-        value = signed_payload(update_config().runtime_dir / 'maintenance.json')
-        return isinstance(value, dict) and type(value.get('run_id')) is int
+        runtime = update_config().runtime_dir
     except UpdateError:
-        # A broken update config must never allow an unsafe deployment to proceed.
-        return True
+        # Update configuration is independent of collection availability. A typo
+        # disables update operations, while a real signed maintenance marker
+        # continues to pause writes even if configuration becomes unreadable.
+        runtime = config.ROOT / 'data' / 'update'
+    value = signed_payload(runtime / 'maintenance.json')
+    return isinstance(value, dict) and type(value.get('run_id')) is int
 
 
 def require_enabled(settings):
@@ -218,13 +221,14 @@ def sync_results(db, settings=None):
     db.commit()
 
 
-def recover_interrupted(db):
+def recover_interrupted(db, lease=None):
     """A dead API/download leaves an explicit failure; never replay an apply job."""
     for run in db.scalars(select(UpdateRun).where(UpdateRun.status.in_(['checking', 'downloading']))):
         if (utcnow() - run.updated_at).total_seconds() < 180:
             continue
         try:
-            locked = redis_connection().exists(LOCK_KEY)
+            owner = redis_connection().get(LOCK_KEY)
+            locked = bool(owner and (lease is None or owner != lease.owner))
         except redis.RedisError:
             continue
         if not locked:
@@ -232,14 +236,17 @@ def recover_interrupted(db):
     for run in db.scalars(select(UpdateRun).where(UpdateRun.status == 'awaiting_host')):
         job = update_config().runtime_dir / 'jobs' / f'{run.id}.json'
         if not job.exists() and (utcnow() - run.updated_at).total_seconds() > 60:
-            # Only recreate a signed, never-published outbox entry. A published job
-            # is never replayed; the host's transaction journal handles its recovery.
-            write_signed_json(job, job_payload(run, update_config()), config.SESSION_SECRET)
+            # Re-publish only the exact committed intent; current YAML must not
+            # turn a previously staged manual restart into an automatic restart.
+            if not run.pending_job:
+                mark_failed(db, run, UpdateError('UPDATE_INTERRUPTED', PUBLIC_ERRORS['UPDATE_INTERRUPTED']))
+                continue
+            write_signed_json(job, run.pending_job, config.SESSION_SECRET)
 
 
-def require_idle(db):
+def require_idle(db, lease=None):
     sync_results(db)
-    recover_interrupted(db)
+    recover_interrupted(db, lease)
     if db.scalar(select(UpdateRun.id).where(UpdateRun.status.in_(BUSY)).limit(1)):
         raise UpdateError('UPDATE_BUSY', '已有更新任务正在执行或等待宿主机处理。', 409)
 
@@ -248,7 +255,7 @@ async def check_update(actor=None):
     settings = update_config()
     require_enabled(settings)
     with update_lock() as lease, SessionLocal() as db:
-        require_idle(db)
+        require_idle(db, lease)
         run = UpdateRun(current_version=VERSION, repository=f'{settings.github_owner}/{settings.github_repo}',
                         status='checking', action='check', message='正在检测正式发布版本',
                         actor_id=actor.id if actor else None, actor=actor.username if actor else 'system', steps=steps_for('check'))
@@ -279,10 +286,12 @@ def begin_download(run_id, actor):
     lease = UpdateLease().acquire()
     try:
         with SessionLocal() as db:
-            require_idle(db)
+            require_idle(db, lease)
             run = db.get(UpdateRun, run_id)
             if not run or run.status != 'available' or not run.release:
                 raise UpdateError('UPDATE_NOT_AVAILABLE', '请先检测并选择可用的新版本。', 409)
+            if run.repository != f'{settings.github_owner}/{settings.github_repo}':
+                raise UpdateError('UPDATE_REPOSITORY_CHANGED', '更新仓库已变更，请重新检测并下载版本。', 409)
             if compare_versions(run.target_version, VERSION) <= 0:
                 raise UpdateError('UPDATE_DOWNGRADE', '目标版本必须高于当前版本。', 409)
             run.status, run.action, run.message = 'downloading', 'download', '正在下载并校验发布包'
@@ -298,12 +307,14 @@ def begin_download(run_id, actor):
 
 async def download_run(run_id, lease):
     try:
-        settings = update_config()
         with SessionLocal() as db:
             run = db.get(UpdateRun, run_id)
             if not run or run.status != 'downloading':
                 return
             try:
+                settings = update_config()
+                if run.repository != f'{settings.github_owner}/{settings.github_repo}':
+                    raise UpdateError('UPDATE_REPOSITORY_CHANGED', '更新仓库已变更，请重新检测并下载版本。', 409)
                 release = ReleaseInfo.from_dict(run.release)
                 destination = settings.runtime_dir / 'packages' / str(run.id)
                 last_progress = 0.0
@@ -334,8 +345,8 @@ async def download_run(run_id, lease):
 def enqueue_apply(run_id, actor):
     settings = update_config()
     require_enabled(settings)
-    with update_lock(), SessionLocal() as db:
-        require_idle(db)
+    with update_lock() as lease, SessionLocal() as db:
+        require_idle(db, lease)
         run = db.get(UpdateRun, run_id)
         if not run or run.status != 'ready' or not run.package or not run.sha256:
             raise UpdateError('UPDATE_NOT_READY', '请先下载并校验更新包。', 409)
@@ -345,10 +356,11 @@ def enqueue_apply(run_id, actor):
             raise UpdateError('UPDATE_REPOSITORY_CHANGED', '更新仓库已变更，请重新检测并下载版本。', 409)
         run.action, run.status, run.message = 'apply', 'awaiting_host', '等待宿主机更新器应用发布包'
         run.actor_id, run.actor, run.updated_at = actor.id, actor.username, utcnow()
+        run.pending_job = job_payload(run, settings)
         db.add(AuditLog(user_id=actor.id, action='update_apply', target=str(run.id)))
         db.commit()
         try:
-            write_signed_json(settings.runtime_dir / 'jobs' / f'{run.id}.json', job_payload(run, settings), config.SESSION_SECRET)
+            write_signed_json(settings.runtime_dir / 'jobs' / f'{run.id}.json', run.pending_job, config.SESSION_SECRET)
         except Exception as exc:
             mark_failed(db, run, exc)
         return run_dict(run)
@@ -371,8 +383,8 @@ def backups(db):
 def enqueue_rollback(backup_id, actor):
     settings = update_config()
     require_enabled(settings)
-    with update_lock(), SessionLocal() as db:
-        require_idle(db)
+    with update_lock() as lease, SessionLocal() as db:
+        require_idle(db, lease)
         selected = next((b for b in backups(db) if b['id'] == backup_id), None)
         if not selected:
             raise UpdateError('BACKUP_NOT_FOUND', '未找到可回滚的旧版本备份。', 404)
@@ -381,10 +393,11 @@ def enqueue_rollback(backup_id, actor):
                         actor=actor.username, backup_id=backup_id, backup_version=selected['version'], steps=steps_for('backup'))
         db.add(run)
         db.flush()
+        run.pending_job = job_payload(run, settings)
         db.add(AuditLog(user_id=actor.id, action='update_rollback', target=str(run.id)))
         db.commit()
         try:
-            write_signed_json(settings.runtime_dir / 'jobs' / f'{run.id}.json', job_payload(run, settings), config.SESSION_SECRET)
+            write_signed_json(settings.runtime_dir / 'jobs' / f'{run.id}.json', run.pending_job, config.SESSION_SECRET)
         except Exception as exc:
             mark_failed(db, run, exc)
         return run_dict(run)

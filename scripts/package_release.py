@@ -20,12 +20,13 @@ PRODUCT = "price-monitor"
 VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
 TREE_ROOTS = ("backend/app", "frontend/src", "frontend/public", "deploy")
 ROOT_FILES = {
-    "README.md", ".env.example", ".dockerignore", "docker-compose.yml",
+    "README.md", "CHANGELOG.md", "docs/releasing.md", ".env.example", ".dockerignore", "docker-compose.yml",
     "backend/Dockerfile", "backend/requirements.txt",
     "frontend/Dockerfile", "frontend/package.json", "frontend/package-lock.json",
     "frontend/index.html", "frontend/vite.config.ts", "frontend/tsconfig.json",
     "frontend/tsconfig.app.json", "frontend/tsconfig.node.json", "frontend/.prettierrc.json",
     "config/update.example.yaml",
+    "scripts/requirements-updater.txt",
 }
 SCRIPT_SUFFIXES = {".py", ".ps1", ".sh"}
 FORBIDDEN_PARTS = {
@@ -57,7 +58,7 @@ def managed_path(name: str) -> bool:
         return False
     if any(part.lower() in FORBIDDEN_PARTS for part in path.parts):
         return False
-    if path.name.startswith(".env") and name != ".env.example":
+    if path.name.casefold().startswith(".env") and name != ".env.example":
         return False
     if path.suffix.lower() in FORBIDDEN_SUFFIXES:
         return False
@@ -99,7 +100,8 @@ def collect_files(root: Path, *, require_dist: bool = True) -> dict[str, Path]:
     return files
 
 
-def build_release(root: Path, output_dir: Path, *, version: str | None = None, require_dist: bool = True) -> tuple[Path, Path]:
+def build_release(root: Path, output_dir: Path, *, version: str | None = None, require_dist: bool = True,
+                  revision: str | None = None) -> tuple[Path, Path]:
     root = root.resolve()
     actual_version = version_from_source(root)
     version = (version or actual_version).removeprefix("v")
@@ -111,6 +113,10 @@ def build_release(root: Path, output_dir: Path, *, version: str | None = None, r
         "schema": 1, "product": PRODUCT, "version": version,
         "files": {name: hashlib.sha256(content).hexdigest() for name, content in contents.items()},
     }
+    if revision is not None:
+        if not re.fullmatch(r"[0-9a-f]{40}", revision) or revision == "0" * 40:
+            raise ValueError("Release revision must be a full Git commit SHA")
+        manifest["revision"] = revision
     contents["release-manifest.json"] = (json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / f"price-monitor-{version}.tar.gz"
@@ -135,9 +141,13 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--version")
+    parser.add_argument("--revision", help="Expected full Git revision; defaults to current HEAD")
     args = parser.parse_args()
     try:
-        package, checksum = build_release(args.root, args.output_dir or args.root / "dist/releases", version=args.version)
+        from validate_release import validate_project
+        metadata = validate_project(args.root, tag=args.version, revision=args.revision)
+        package, checksum = build_release(args.root, args.output_dir or args.root / "dist/releases",
+                                           version=metadata["version"], revision=metadata["revision"])
     except (OSError, ValueError, SyntaxError) as exc:
         parser.exit(1, f"Release packaging failed: {exc}\n")
     print(json.dumps({"package": str(package), "checksum": str(checksum)}, ensure_ascii=False))

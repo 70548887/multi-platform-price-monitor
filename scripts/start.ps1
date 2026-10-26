@@ -11,6 +11,8 @@ try {
         python (Join-Path $PSScriptRoot 'init_env.py')
         if ($LASTEXITCODE -ne 0) { throw 'Secret generation failed.' }
     }
+    python (Join-Path $PSScriptRoot 'init_env.py') --prepare-config-only
+    if ($LASTEXITCODE -ne 0) { throw 'Update configuration initialization failed.' }
     docker compose up -d --build --wait --wait-timeout 240
     if ($LASTEXITCODE -ne 0) { throw 'Deployment did not reach a healthy state. Inspect docker compose ps and docker compose logs.' }
     Write-Host 'Deployment is healthy. Default address: http://127.0.0.1:28671 (or your .env WEB_PORT).'

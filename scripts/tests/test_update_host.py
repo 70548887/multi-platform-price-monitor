@@ -12,12 +12,14 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.request import Request
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS.parent / "backend"))
 from package_release import build_release, managed_path  # noqa: E402
-from update_host import HostUpdater, UpdateError, process_lock  # noqa: E402
+import update_host
+from update_host import HostUpdater, HostProbe, NoHostRedirect, UpdateError, process_lock  # noqa: E402
 from app.update_common import read_signed_json, write_signed_json  # noqa: E402
 
 
@@ -82,6 +84,9 @@ class FakeHost(HostUpdater):
 
     def _start(self, job, activation):
         self.starts.append(activation)
+
+    def _services_healthy(self):
+        return True
 
 
 class ReleasePackageTests(unittest.TestCase):
@@ -243,8 +248,71 @@ class HostTransactionTests(unittest.TestCase):
                 with self.assertRaises(UpdateError):
                     self.host.validate_job(job, "1.json")
         (self.host.data_dir / "jobs/1.json").write_text(json.dumps(self.job))
-        with self.assertRaises(UpdateError):
-            self.host.run_once()
+        self.assertIsNone(self.host.run_once())
+        self.assertFalse((self.host.data_dir / "jobs/1.json").exists())
+        self.assertEqual(len(list((self.host.data_dir / 'rejected_jobs').iterdir())), 1)
+        result = read_signed_json(self.host.data_dir / 'results/1.json', SECRET)
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['error_code'], 'INVALID_HOST_JOB')
+
+    def test_crash_before_terminal_publication_replays_only_completion(self):
+        original = self.host.result
+        def interrupt(job, status, *args, **kwargs):
+            if status == 'succeeded':
+                raise KeyboardInterrupt('fixture interruption before final result')
+            return original(job, status, *args, **kwargs)
+        with patch.object(self.host, 'result', interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.host.run_once()
+        record = read_signed_json(self.host.journal_path(1), SECRET)
+        self.assertEqual(record['phase'], 'completed')
+        self.assertTrue((self.host.data_dir / 'maintenance.json').exists())
+        stops, starts = self.host.stops, len(self.host.starts)
+        resumed = self.host.run_once()
+        self.assertEqual(resumed['status'], 'succeeded')
+        self.assertEqual(self.host.stops, stops)
+        self.assertEqual(len(self.host.starts), starts)
+        self.assertFalse(self.host.journal_path(1).exists())
+        self.assertFalse((self.host.data_dir / 'maintenance.json').exists())
+
+    def test_crash_after_terminal_publication_does_not_restart(self):
+        with patch.object(self.host, '_clear_maintenance', side_effect=KeyboardInterrupt('fixture cleanup crash')):
+            with self.assertRaises(KeyboardInterrupt):
+                self.host.run_once()
+        self.assertEqual(read_signed_json(self.host.data_dir / 'results/1.json', SECRET)['status'], 'succeeded')
+        stops, starts = self.host.stops, len(self.host.starts)
+        self.assertEqual(self.host.run_once()['status'], 'succeeded')
+        self.assertEqual(self.host.stops, stops)
+        self.assertEqual(len(self.host.starts), starts)
+
+    def test_crash_before_rollback_terminal_publication_does_not_reapply(self):
+        self.host.fail_new_health = True
+        original = self.host.result
+        def interrupt(job, status, *args, **kwargs):
+            if status == 'rolled_back':
+                raise KeyboardInterrupt('fixture rollback terminal crash')
+            return original(job, status, *args, **kwargs)
+        with patch.object(self.host, 'result', interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.host.run_once()
+        starts = len(self.host.starts)
+        resumed = self.host.run_once()
+        self.assertEqual(resumed['status'], 'rolled_back')
+        self.assertEqual(resumed['version'], '1.0.0')
+        self.assertEqual(len(self.host.starts), starts)
+        self.assert_private_preserved()
+
+    def test_bad_first_job_does_not_starve_valid_next_job(self):
+        (self.host.data_dir / 'jobs/1.json').write_text('unsigned fixture input')
+        old_package = self.host.data_dir / self.job['package']
+        new_package = self.host.data_dir / 'packages/2' / old_package.name
+        new_package.parent.mkdir(parents=True)
+        new_package.write_bytes(old_package.read_bytes())
+        next_job = {**self.job, 'run_id': 2, 'package': new_package.relative_to(self.host.data_dir).as_posix()}
+        write_signed_json(self.host.data_dir / 'jobs/2.json', next_job, SECRET)
+        result = self.host.run_once()
+        self.assertEqual(result['status'], 'succeeded')
+        self.assertEqual(result['run_id'], 2)
 
     def test_native_dependency_rollback_preserves_original_node_tree(self):
         nodes = self.root / "frontend/node_modules"
@@ -261,6 +329,53 @@ class HostTransactionTests(unittest.TestCase):
             with self.assertRaises(UpdateError):
                 with process_lock(self.host.data_dir / "test.lock"):
                     self.fail("duplicate lock acquired")
+
+
+class ActualServiceProbeTests(unittest.TestCase):
+    def test_compose_process_health_rejects_stale_api_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [{'Service': name, 'State': 'running', 'Health': 'healthy'}
+                    for name in ('api', 'worker', 'beat', 'web')]
+            runner = lambda *args, **kwargs: '\n'.join(json.dumps(row) for row in rows)
+            host = HostUpdater(root, root / 'data/update', root / 'data/backups', mode='compose',
+                               secret=SECRET, runner=runner,
+                               probe=lambda *args: {'status': 'ok', 'version': '1.0.0', 'worker': True,
+                                                    'beat': True, 'database': True, 'redis': True})
+            self.assertTrue(host._healthy({'run_id': 1}, '1.0.0'))
+            rows[2]['State'] = 'exited'
+            rows[2]['Health'] = ''
+            self.assertFalse(host._healthy({'run_id': 1}, '1.0.0'))
+
+    def test_native_process_health_rejects_dead_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [{'service': name, 'running': True, 'pid': index + 1}
+                    for index, name in enumerate(('api', 'worker', 'beat', 'web'))]
+            host = HostUpdater(root, root / 'data/update', root / 'data/backups', mode='native',
+                               secret=SECRET, runner=lambda *args, **kwargs: json.dumps(rows))
+            self.assertTrue(host._services_healthy())
+            rows[1]['running'] = False
+            self.assertFalse(host._services_healthy())
+
+    def test_host_proof_does_not_follow_any_redirect(self):
+        request = Request('http://127.0.0.1:28671/api/update/host/health', headers={'X-Update-Host-Proof': 'fixture-proof'})
+        handler = NoHostRedirect()
+        for url in ('http://127.0.0.1:28671/elsewhere', 'https://other.example/health'):
+            self.assertIsNone(handler.redirect_request(request, None, 302, 'Found', {}, url))
+
+    def test_cli_loads_backup_directory_from_yaml(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'config').mkdir()
+            (root / 'config/update.yaml').write_text('update:\n  backup_dir: ./data/custom-backups\n')
+            (root / '.env').write_text('SESSION_SECRET=' + SECRET + '\n')
+            with patch.object(sys, 'argv', ['update_host.py', '--root', str(root), '--once']), \
+                    patch.object(update_host, 'HostUpdater') as constructor:
+                constructor.return_value.data_dir = root / 'data/update'
+                constructor.return_value.run_once.return_value = None
+                self.assertEqual(update_host.main(), 0)
+                self.assertEqual(constructor.call_args.args[2], root.resolve() / 'data/custom-backups')
 
 
 if __name__ == "__main__":

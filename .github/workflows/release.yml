@@ -3,6 +3,11 @@ name: Release
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -48,6 +53,14 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+      - name: Validate official tag, synchronized versions and release notes
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            python scripts/validate_release.py --tag "$GITHUB_REF_NAME" --revision "$GITHUB_SHA"
+          else
+            python scripts/validate_release.py --revision "$GITHUB_SHA"
+          fi
       - name: Install test dependencies
         run: python -m pip install -r backend/requirements-dev.txt
       - name: Run isolated backend and operational tests
@@ -57,8 +70,12 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: Validate tag and build allowlisted release
-        run: python scripts/package_release.py --version "$GITHUB_REF_NAME"
+      - name: Run isolated real Docker upgrade and rollback drill
+        run: python scripts/docker_update_smoke.py --run
+      - name: Build and independently verify allowlisted release
+        run: |
+          python scripts/package_release.py --revision "$GITHUB_SHA"
+          python scripts/validate_release.py --revision "$GITHUB_SHA" --assets dist/releases --notes-output dist/releases/release-notes.md
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets
@@ -68,6 +85,7 @@ jobs:
 
   publish:
     needs: test-and-package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -77,8 +95,22 @@ jobs:
         with:
           name: release-assets
           path: dist/releases
-      - name: Publish tested GitHub Release assets
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Recheck artifact provenance before publishing
+        run: python scripts/validate_release.py --tag "$GITHUB_REF_NAME" --revision "$GITHUB_SHA" --assets dist/releases --notes-output dist/releases/release-notes.md
+      - name: Upload draft, verify uploaded bytes, then publish formal Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" dist/releases/* --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          package="price-monitor-${version}.tar.gz"
+          tag_commit="$(gh api "repos/$GH_REPO/commits/$GITHUB_REF_NAME" --jq .sha)"
+          test "$tag_commit" = "$GITHUB_SHA"
+          gh release create "$GITHUB_REF_NAME" "dist/releases/$package" "dist/releases/$package.sha256" --draft --verify-tag --target "$GITHUB_SHA" --notes-file dist/releases/release-notes.md --title "PriceScope $GITHUB_REF_NAME"
+          gh release download "$GITHUB_REF_NAME" --dir verified-upload --pattern "$package" --pattern "$package.sha256"
+          python scripts/validate_release.py --tag "$GITHUB_REF_NAME" --revision "$GITHUB_SHA" --assets verified-upload
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest

@@ -105,6 +105,10 @@ def load_update_config(root: Path | None = None, environ: Mapping[str, str] | No
         raise UpdateError("invalid_update_config", "更新备份目录格式错误")
     backup_path = Path(backup)
     resolved["backup_dir"] = (backup_path if backup_path.is_absolute() else root / backup_path).resolve()
-    if resolved["backup_dir"] == root:
-        raise UpdateError("invalid_update_config", "更新备份目录不能为应用根目录")
+    runtime = root / 'data' / 'update'
+    if (not resolved['backup_dir'].is_relative_to(root / 'data')
+            or resolved['backup_dir'] == root / 'data'
+            or resolved['backup_dir'].is_relative_to(runtime)
+            or runtime.is_relative_to(resolved['backup_dir'])):
+        raise UpdateError('invalid_update_config', '更新备份目录须位于项目 data 内，并与更新任务目录分开')
     return UpdateConfig(root=root, **resolved)

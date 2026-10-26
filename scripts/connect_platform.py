@@ -345,7 +345,7 @@ async def validate_source_session(origin: str, session: str, *, adapter: str = "
 
 async def wait_for_source_token(browser: Any, context: Any, origin: str, timeout: int, capture_callback: Any = None,
                                 *, adapter: str = "xiaohong66", token_storage_key: str | None = None,
-                                rule: dict[str, Any] | None = None) -> str:
+                                rule: dict[str, Any] | None = None, validate_callback: Any = None) -> str:
     backend_path = str(ROOT / "backend")
     if backend_path not in sys.path:
         sys.path.insert(0, backend_path)
@@ -394,7 +394,10 @@ async def wait_for_source_token(browser: Any, context: Any, origin: str, timeout
                         captured = capture_callback(session)
                         if inspect.isawaitable(captured):
                             await captured
-                    await validate_source_session(origin, session, **_source_options(adapter, rule))
+                    if validate_callback is not None:
+                        await validate_callback(session)
+                    else:
+                        await validate_source_session(origin, session, **_source_options(adapter, rule))
                     print("平台账户资料校验通过，正在连接监控后台。", flush=True)
                     return session
                 except Exception as exc:
@@ -480,9 +483,18 @@ async def connect(args: argparse.Namespace, httpx: Any, playwright_module: Any) 
         adapter = str(platform["adapter"])
         login_url, storage_key = source_login_settings(platform)
         rule = await source_rule(client, platform, origin)
+        server_validation = platform.get('proxy_route', 'direct') != 'direct'
+
+        async def validate_via_server(session: str) -> None:
+            # The server owns proxy credentials and validates through the chosen
+            # platform route. Do not fetch plaintext proxy secrets to this helper.
+            await api_json(client, "PUT", f"/api/platforms/{args.platform_id}/session", action="通过平台代理校验会话",
+                           json={"token": session}, headers={"X-CSRF-Token": csrf})
+
         if pending is not None:
             try:
-                await validate_source_session(origin, pending, **_source_options(adapter, rule))
+                if not server_validation:
+                    await validate_source_session(origin, pending, **_source_options(adapter, rule))
                 await api_json(client, "PUT", f"/api/platforms/{args.platform_id}/session", action="恢复平台会话", json={"token": pending}, headers={"X-CSRF-Token": csrf})
             except Exception as exc:
                 raise ConnectionFailure("恢复会话未完成（" + _safe_error_summary(exc) + "），加密文件已保留。") from None
@@ -521,12 +533,15 @@ async def connect(args: argparse.Namespace, httpx: Any, playwright_module: Any) 
                 next_upload_diagnostic = 0.0
                 while time.monotonic() < connection_deadline:
                     wait_options = _source_options(adapter, rule)
+                    if server_validation:
+                        wait_options['validate_callback'] = validate_via_server
                     if storage_key != SOURCE_ADAPTERS["xiaohong66"]["token_storage_key"] or adapter != "xiaohong66":
                         wait_options["token_storage_key"] = storage_key
                     session = await wait_for_source_token(browser, context, origin, max(1, int(connection_deadline - time.monotonic())),
                                                           capture_callback=capture_candidate, **wait_options)
                     try:
-                        await api_json(client, "PUT", f"/api/platforms/{args.platform_id}/session", action="连接平台会话", json={"token": session}, headers={"X-CSRF-Token": csrf})
+                        if not server_validation:
+                            await api_json(client, "PUT", f"/api/platforms/{args.platform_id}/session", action="连接平台会话", json={"token": session}, headers={"X-CSRF-Token": csrf})
                     except ConnectionFailure as exc:
                         if time.monotonic() >= next_upload_diagnostic:
                             print("后台暂未接受平台会话（" + _safe_error_summary(exc) + "），保留当前窗口，30 秒后重试。", flush=True)

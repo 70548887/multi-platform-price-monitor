@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
+import re
 
 
 class CollectorError(Exception):
@@ -49,6 +50,20 @@ def safe_collection_error(exc: BaseException) -> str:
         reason = _SAFE_INCOMPLETE_COLLECTION_REASONS.get(exc.args[0])
         if reason is not None:
             return f"采集不完整：{reason}"
+    if type(exc) is CollectorError and len(exc.args) == 1 and type(exc.args[0]) is str:
+        safe = {
+            'Source proxy configuration is invalid': '采集代理配置无效，请检查系统设置',
+            'Source proxy request failed after limited retries': '采集代理连接失败，有限重试后仍未恢复',
+            'Source network request failed after limited retries': '采集网络请求失败，有限重试后仍未恢复',
+            '采集代理路由无效，请检查平台代理设置': '采集代理路由无效，请检查平台代理设置',
+            '平台指定的采集代理尚未配置或未启用': '平台指定的采集代理尚未配置或未启用',
+            '采集代理配置无法读取，请在系统设置中重新保存': '采集代理配置无法读取，请在系统设置中重新保存',
+        }
+        if exc.args[0] in safe:
+            return safe[exc.args[0]]
+        match = re.fullmatch(r'Source HTTP (429|5[0-9]{2}) after limited retries', exc.args[0])
+        if match:
+            return f'源站 HTTP {match[1]}，有限重试后仍未恢复'
     return f"采集执行异常：{type(exc).__name__}"
 
 

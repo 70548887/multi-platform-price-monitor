@@ -6,5 +6,6 @@ docker info --format '{{.ServerVersion}}'
 if [ ! -f .env ]; then
     python3 scripts/init_env.py
 fi
+python3 scripts/init_env.py --prepare-config-only
 docker compose up -d --build --wait --wait-timeout 240
 printf '%s\n' 'Deployment is healthy. Default address: http://127.0.0.1:28671 (or your .env WEB_PORT).'

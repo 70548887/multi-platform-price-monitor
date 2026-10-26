@@ -89,6 +89,7 @@ const activeStates = [
   'applying',
   'restarting',
   'rolling_back',
+  'applied',
 ]
 const isActive = computed(() => activeStates.includes(run.value?.status ?? ''))
 const isBusy = computed(() => Boolean(actionBusy.value) || isActive.value)
@@ -115,6 +116,7 @@ const statusLabels: Record<string, string> = {
   up_to_date: '已是最新版本',
   downloading: '下载中',
   ready: '已校验，待安装',
+  applied: '已应用，等待手动重启',
   awaiting_host: '等待宿主机更新器',
   applying: '安装中',
   restarting: '服务重启中',

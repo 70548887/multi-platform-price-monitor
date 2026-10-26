@@ -36,6 +36,8 @@ from .update_api import router as update_router
 from .update_common import UpdateError
 from .update_service import maintenance_active
 from .version import VERSION
+from .network_settings import get_platform_proxy
+from .network_api import router as network_router
 
 STARTED = time.monotonic()
 
@@ -49,6 +51,8 @@ async def lifespan(app):
         connection.execute(text('ALTER TABLE platforms ADD COLUMN IF NOT EXISTS account_fingerprint VARCHAR(64)'))
         connection.execute(text("ALTER TABLE platforms ADD COLUMN IF NOT EXISTS platform_type VARCHAR(40) NOT NULL DEFAULT 'yile'"))
         connection.execute(text("ALTER TABLE update_runs ADD COLUMN IF NOT EXISTS repository VARCHAR(240) NOT NULL DEFAULT ''"))
+        connection.execute(text("ALTER TABLE update_runs ADD COLUMN IF NOT EXISTS pending_job JSON NOT NULL DEFAULT '{}'::json"))
+        connection.execute(text("ALTER TABLE platforms ADD COLUMN IF NOT EXISTS proxy_route VARCHAR(16) NOT NULL DEFAULT 'direct'"))
     with SessionLocal() as db:
         if db.scalar(select(User.id).limit(1)) is None:
             if len(config.ADMIN_PASSWORD) < 12:
@@ -83,6 +87,7 @@ async def update_error(request, exc):
 
 
 app.include_router(update_router)
+app.include_router(network_router)
 
 
 def require(db, model, identifier):
@@ -108,6 +113,7 @@ def platform_dict(db, p):
             'type_locked': bool(count or p.encrypted_session or p.active_rule_id),
             'account_label': p.account_label, 'enabled': p.enabled, 'interval_seconds': p.interval_seconds,
             'request_interval': float(p.request_interval), 'auth_status': p.auth_status,
+            'proxy_route': p.proxy_route,
             'last_success_at': iso(p.last_success_at), 'last_error': p.last_error,
             'active_rule_id': p.active_rule_id,
             'product_count': count}
@@ -186,6 +192,7 @@ class PlatformInput(BaseModel):
     enabled: bool = True
     interval_seconds: int = Field(default=3600, ge=3600, le=604800)
     request_interval: Decimal = Field(default=Decimal('1'), ge=1, le=60)
+    proxy_route: Literal['direct', 'tunnel', 'overseas'] = 'direct'
 
     @field_validator('base_url')
     @classmethod
@@ -233,6 +240,11 @@ def create_platform(body: PlatformInput, db: Session = Depends(get_db), user=Dep
 def edit_platform(platform_id: int, body: PlatformInput, db: Session = Depends(get_db), user=Depends(admin_user)):
     p = require(db, Platform, platform_id)
     db.refresh(p, with_for_update=True)
+    if 'proxy_route' not in body.model_fields_set:
+        body = body.model_copy(update={'proxy_route': p.proxy_route})
+    if body.proxy_route != p.proxy_route and db.scalar(select(CollectionRun.id).where(
+            CollectionRun.platform_id == p.id, CollectionRun.status.in_(['running', 'queued']))):
+        raise HTTPException(409, '请等待当前采集批次结束后修改代理路由')
     changed_version = body.adapter != p.adapter or body.platform_type != p.platform_type
     if changed_version:
         if p.encrypted_session or p.active_rule_id or db.scalar(select(Product.id).where(Product.platform_id == p.id).limit(1)):
@@ -273,7 +285,8 @@ async def connect_session(platform_id: int, body: SessionInput, db: Session = De
         collector = None
         try:
             source_class = Xiaohong66Collector if p.adapter == 'xiaohong66' else Fans8Collector
-            collector = source_class(p.base_url, body.token, configured.config if configured else adapter_default_rule(p.adapter), request_gate=gate, sleep=gate.sleep)
+            proxy_options = {'proxy_url': get_platform_proxy(db, p)} if getattr(p, 'proxy_route', 'direct') != 'direct' else {}
+            collector = source_class(p.base_url, body.token, configured.config if configured else adapter_default_rule(p.adapter), request_gate=gate, sleep=gate.sleep, **proxy_options)
             await collector.check_session()
         except CollectorError as exc:
             raise HTTPException(400, '会话校验失败，请确认账号已登录且平台地址正确') from exc
@@ -372,7 +385,8 @@ async def test_rule(rule_id: int, body: RuleTestInput, db: Session = Depends(get
         collector = None
         try:
             source_class = Xiaohong66Collector if p.adapter == 'xiaohong66' else Fans8Collector
-            collector = source_class(p.base_url, decrypt_session(p.encrypted_session), rule.config, request_gate=gate, sleep=gate.sleep)
+            proxy_options = {'proxy_url': get_platform_proxy(db, p)} if getattr(p, 'proxy_route', 'direct') != 'direct' else {}
+            collector = source_class(p.base_url, decrypt_session(p.encrypted_session), rule.config, request_gate=gate, sleep=gate.sleep, **proxy_options)
             categories = await collector.list_categories()
             if body.source_product_id:
                 products = [await collector.get_product(body.source_product_id)]
