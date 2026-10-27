@@ -24,6 +24,16 @@ from .session import normalize_https_origin
 from .xiaohong66 import Xiaohong66Collector, _at, _decimal, _json_safe
 
 
+def source_category_label(source: dict[str, Any]) -> str:
+    """Keep the category breadcrumb supplied by the real catalogue response.
+
+    The live list uses ClassName1/2/3 and often omits every CategoryId field.
+    These are source labels; never infer a category from a product's title.
+    """
+    return " / ".join(value.strip() for key in ('ClassName1', 'ClassName2', 'ClassName3')
+                      if isinstance((value := source.get(key)), str) and value.strip())
+
+
 FANS8_DEFAULT_RULE: dict[str, Any] = {
     "api_prefix": "",
     "category_path": "/api/goodsClassList",
@@ -360,7 +370,8 @@ class Fans8Collector(Xiaohong66Collector):
                 break
         category_id = str(value("category_id", "CategoryId", category_id)) if "category_id" in mapping else category_id
         category = next((item for item in self.categories if str(item["id"]) == category_id), category or {})
-        category_name = str(_at(source, str(mapping["category_name"]), "")) if "category_name" in mapping else str(category.get("name", ""))
+        category_name = (str(_at(source, str(mapping["category_name"]), "")) if "category_name" in mapping
+                         else source_category_label(source) or str(category.get("name", "")))
         return SourceProduct(
             source_id=identifier, name=name, category_id=category_id or str(category.get("id", "")),
             category_name=category_name, price=price, unit=unit, display_quantity=quantity,

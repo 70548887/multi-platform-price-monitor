@@ -11,7 +11,9 @@ x-backend: &backend
     DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-price_monitor}:${POSTGRES_PASSWORD:?Run python scripts/init_env.py}@db:5432/${POSTGRES_DB:-price_monitor}
     REDIS_URL: redis://redis:6379/0
     ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-    ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Run python scripts/init_env.py}
+    ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin888}
+    DEFAULT_USER_USERNAME: ${DEFAULT_USER_USERNAME:-user}
+    DEFAULT_USER_PASSWORD: ${DEFAULT_USER_PASSWORD:-user123}
     SESSION_SECRET: ${SESSION_SECRET:?Run python scripts/init_env.py}
     ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Run python scripts/init_env.py}
     UPDATE_GITHUB_TOKEN: ${UPDATE_GITHUB_TOKEN:-}
@@ -72,19 +74,35 @@ services:
 
   worker:
     <<: *backend
-    command: [celery, -A, 'app.tasks:celery_app', worker, --loglevel=info, --concurrency=2, '--hostname=worker@%h']
+    command: [celery, -A, 'app.tasks:celery_app', worker, -Q, celery, --loglevel=info, --concurrency=2, '--hostname=collector@%h']
     depends_on:
       api:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: [CMD-SHELL, 'celery -A app.tasks:celery_app inspect ping --destination "worker@$$HOSTNAME" --timeout 5 | grep -q pong']
+      test: [CMD-SHELL, 'celery -A app.tasks:celery_app inspect ping --destination "collector@$$HOSTNAME" --timeout 5 | grep -q pong']
       interval: 30s
       timeout: 15s
       retries: 3
       start_period: 40s
     stop_grace_period: 60s
+
+  ai-worker:
+    <<: *backend
+    command: [celery, -A, 'app.tasks:celery_app', worker, -Q, ai, --loglevel=info, --concurrency=1, '--hostname=ai_worker@%h', --pidfile=/tmp/ai-worker.pid]
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, /app/container_health.py, ai-worker]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    stop_grace_period: 150s
 
   beat:
     <<: *backend

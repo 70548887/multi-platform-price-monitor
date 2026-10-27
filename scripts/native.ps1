@@ -131,7 +131,7 @@ function Start-Owned([string]$Label, [string]$Executable, [string[]]$Arguments, 
 }
 
 if ($Action -eq 'status') {
-    foreach ($label in @('postgres', 'redis', 'api', 'worker', 'beat', 'web', 'acceptance')) {
+    foreach ($label in @('postgres', 'redis', 'api', 'worker', 'ai-worker', 'beat', 'web', 'acceptance')) {
         $ownedProcess = Get-OwnedProcess $label
         [pscustomobject]@{ service = $label; running = [bool]$ownedProcess; pid = if ($ownedProcess) { $ownedProcess.Id } else { $null } }
     }
@@ -139,7 +139,7 @@ if ($Action -eq 'status') {
 }
 
 if ($Action -eq 'stop') {
-    foreach ($label in @('acceptance', 'web', 'beat', 'worker', 'api', 'redis', 'postgres')) {
+    foreach ($label in @('acceptance', 'web', 'beat', 'ai-worker', 'worker', 'api', 'redis', 'postgres')) {
         $ownedProcess = Get-OwnedProcess $label
         if ($ownedProcess) {
             if ($label -eq 'postgres') {
@@ -165,7 +165,7 @@ if ($Action -eq 'stop') {
 }
 
 if ($Action -eq 'restart-app' -or $Action -eq 'stop-app') {
-    foreach ($label in @('web', 'beat', 'worker', 'api')) {
+    foreach ($label in @('web', 'beat', 'ai-worker', 'worker', 'api')) {
         Stop-OwnedApp $label
         $records.Remove($label)
         Save-Records
@@ -260,7 +260,8 @@ if (-not (Test-Path -LiteralPath $viteEntry)) { throw 'Run npm ci in frontend fi
 if (-not (Get-OwnedProcess 'api')) { Assert-FreePort $ApiPort }
 Start-Owned 'api' $appPythonExe @('-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', "$ApiPort") (Join-Path $repoRoot 'backend')
 Wait-Port $ApiPort 'API'
-Start-Owned 'worker' $appPythonExe @('-m', 'celery', '-A', 'app.tasks:celery_app', 'worker', '--pool=solo', '--concurrency=1', '--loglevel=info') (Join-Path $repoRoot 'backend')
+Start-Owned 'worker' $appPythonExe @('-m', 'celery', '-A', 'app.tasks:celery_app', 'worker', '-Q', 'celery', '--hostname=collector@%h', '--pool=solo', '--concurrency=1', '--loglevel=info') (Join-Path $repoRoot 'backend')
+Start-Owned 'ai-worker' $appPythonExe @('-m', 'celery', '-A', 'app.tasks:celery_app', 'worker', '-Q', 'ai', '--hostname=ai_worker@%h', '--pool=solo', '--concurrency=1', '--loglevel=info') (Join-Path $repoRoot 'backend')
 Start-Owned 'beat' $appPythonExe @('-m', 'celery', '-A', 'app.tasks:celery_app', 'beat', '--loglevel=info', '--max-interval=30', '--schedule', ('"' + (Join-Path $runtimeRoot 'celerybeat-schedule') + '"')) (Join-Path $repoRoot 'backend')
 if (-not (Get-OwnedProcess 'web')) { Assert-FreePort $WebPort }
 Start-Owned 'web' $nodeExecutable @(('"' + $viteEntry + '"'), '--host', '127.0.0.1', '--port', "$WebPort", '--strictPort') (Join-Path $repoRoot 'frontend')

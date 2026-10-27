@@ -22,6 +22,7 @@ class UpdateConfig:
     github_token: str = field(default="", repr=False, compare=False)
     check_interval: int = 0
     proxy: str = field(default="", repr=False, compare=False)
+    proxy_route: str = 'custom'
     auto_download: bool = False
     auto_restart: bool = True
     backup_dir: Path = Path("data/backups")
@@ -38,6 +39,7 @@ class UpdateConfig:
             "github_repo": self.github_repo,
             "token_configured": bool(self.github_token),
             "proxy_configured": bool(self.proxy),
+            "proxy_route": self.proxy_route if self.proxy_route != 'custom' or self.proxy else 'direct',
             "check_interval": self.check_interval,
             "auto_download": self.auto_download,
             "auto_restart": self.auto_restart,
@@ -70,6 +72,8 @@ def load_update_config(root: Path | None = None, environ: Mapping[str, str] | No
             raise UpdateError("invalid_update_config", "更新开关必须为布尔值")
     if type(resolved["check_interval"]) is not int or resolved["check_interval"] < 0:
         raise UpdateError("invalid_update_config", "自动检测间隔必须为非负整数")
+    if resolved['proxy_route'] not in ('direct', 'overseas', 'custom'):
+        raise UpdateError('invalid_update_config', '更新代理线路须为 direct、overseas 或 custom')
     for name in ("github_owner", "github_repo"):
         if not isinstance(resolved[name], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", resolved[name]):
             raise UpdateError("invalid_update_config", "GitHub 仓库名称格式错误")

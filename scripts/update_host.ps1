@@ -11,8 +11,30 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $resolvedRoot = [IO.Path]::GetFullPath($Root)
+if (-not $PythonExe) {
+    $PythonExe = Join-Path $resolvedRoot '.venv\Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $PythonExe)) { $PythonExe = (Get-Command python -ErrorAction Stop).Source }
+}
 if (-not $DataDir) { $DataDir = Join-Path $resolvedRoot 'data\update' }
-if (-not $BackupDir) { $BackupDir = Join-Path $resolvedRoot 'data\backups' }
+if (-not $BackupDir) {
+    # Resolve the same YAML default as the Python daemon before protecting the
+    # directory. Passing a hardcoded --backup-dir here would override YAML.
+    $backupResolver = @'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / 'backend'))
+try:
+    from app.update_config import load_update_config
+    print(load_update_config(root=root).backup_dir)
+except Exception:
+    print('Could not resolve updater backup configuration.', file=sys.stderr)
+    raise SystemExit(1)
+'@
+    $configuredBackup = & $PythonExe -c $backupResolver $resolvedRoot
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read the updater backup directory from configuration.' }
+    $BackupDir = ([string]$configuredBackup).Trim()
+}
 $resolvedData = [IO.Path]::GetFullPath($DataDir)
 $resolvedBackup = [IO.Path]::GetFullPath($BackupDir)
 $dataBoundary = [IO.Path]::GetFullPath((Join-Path $resolvedRoot 'data')) + [IO.Path]::DirectorySeparatorChar
@@ -20,14 +42,27 @@ foreach ($path in @($resolvedData, $resolvedBackup)) {
     if (-not $path.StartsWith($dataBoundary, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Updater runtime and backup directories must be inside this project data directory.'
     }
+    $currentPath = $path
+    while ($currentPath -and $currentPath -ne $resolvedRoot) {
+        if (Test-Path -LiteralPath $currentPath) {
+            $item = Get-Item -LiteralPath $currentPath -Force
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw 'Updater directories cannot contain links or reparse points.'
+            }
+        }
+        $currentPath = Split-Path -Parent $currentPath
+    }
+}
+if ($resolvedData -eq $resolvedBackup -or
+    $resolvedData.StartsWith($resolvedBackup + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+    $resolvedBackup.StartsWith($resolvedData + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Updater runtime and backup directories must be separate.'
+}
+foreach ($path in @($resolvedData, $resolvedBackup)) {
     [IO.Directory]::CreateDirectory($path) | Out-Null
     $identitySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     & icacls.exe $path '/inheritance:r' '/grant:r' "*${identitySid}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Could not protect the updater runtime directory.' }
-}
-if (-not $PythonExe) {
-    $PythonExe = Join-Path $resolvedRoot '.venv\Scripts\python.exe'
-    if (-not (Test-Path -LiteralPath $PythonExe)) { $PythonExe = (Get-Command python -ErrorAction Stop).Source }
 }
 $scriptPath = Join-Path $resolvedRoot 'scripts\update_host.py'
 $arguments = @('-u', ('"' + $scriptPath + '"'), '--root', ('"' + $resolvedRoot + '"'),

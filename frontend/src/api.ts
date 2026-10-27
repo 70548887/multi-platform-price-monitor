@@ -4,6 +4,8 @@ export interface User {
   id: number
   username: string
   role: 'admin' | 'viewer'
+  platform_ids?: number[]
+  all_platforms?: boolean
   is_active?: boolean
 }
 export interface Collection<T = Record<string, any>> {

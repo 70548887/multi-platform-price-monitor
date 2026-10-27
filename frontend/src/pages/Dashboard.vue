@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import { onMounted, ref, computed } from 'vue'
+import { useRoute } from 'vue-router'
+import { areaPath } from '../navigation'
 import { api, date, statusLabel } from '../api'
 import Icon from '../components/Icon.vue'
+const route = useRoute()
+const adminArea = computed(() => Boolean(route.meta?.admin))
 import Badge from '../components/Badge.vue'
 import EmptyState from '../components/EmptyState.vue'
 const data = ref<any>(null),
@@ -22,7 +26,7 @@ const metrics = computed(() => [
     value: data.value?.platform_count ?? 0,
     icon: 'platforms',
     color: 'blue',
-    hint: '独立规则 · 统一管理',
+    hint: adminArea.value ? '独立规则 · 统一管理' : '仅显示已授权平台',
   },
   {
     label: '监控商品总数',
@@ -67,19 +71,23 @@ const bars = computed(() => {
           {{
             data.last_collection_at
               ? `最近采集：${date(data.last_collection_at)}`
-              : '连接第一个平台，开始建立价格历史。'
+              : adminArea
+                ? '连接第一个平台，开始建立价格历史。'
+                : '暂时没有可查看的价格数据，请联系管理员分配平台。'
           }}
         </p>
       </div>
-      <RouterLink to="/platforms" class="btn btn-white"
+      <RouterLink v-if="adminArea" to="/admin/platforms" class="btn btn-white"
         >管理平台<Icon name="arrow" :size="15"
       /></RouterLink>
     </div>
-    <div v-if="data.auth_expired_count" class="notice warning">
+    <div v-if="adminArea && data.auth_expired_count" class="notice warning">
       <Icon name="alert" :size="18" />{{
         data.auth_expired_count
       }}
-      个平台的采集会话需要连接或更新。请在平台管理中处理。<RouterLink to="/platforms"
+      个平台的采集会话需要连接或更新。请在平台管理中处理。<RouterLink
+        v-if="adminArea"
+        to="/admin/platforms"
         >前往处理 →</RouterLink
       >
     </div>
@@ -102,7 +110,7 @@ const bars = computed(() => {
             <h2>采集运行情况</h2>
             <p>最近批次的执行状态</p>
           </div>
-          <RouterLink to="/runs" class="text-link"
+          <RouterLink v-if="adminArea" to="/admin/runs" class="text-link"
             >查看全部<Icon name="arrow" :size="14"
           /></RouterLink>
         </div>
@@ -129,8 +137,12 @@ const bars = computed(() => {
             v-else
             icon="clock"
             title="尚无采集任务"
-            description="添加平台并连接采集会话后，即可运行首次采集。"
-            ><RouterLink to="/platforms" class="btn btn-primary btn-sm"
+            :description="
+              adminArea
+                ? '添加平台并连接采集会话后，即可运行首次采集。'
+                : '已授权平台采集完成后，这里显示数据状态。'
+            "
+            ><RouterLink v-if="adminArea" to="/admin/platforms" class="btn btn-primary btn-sm"
               >接入平台</RouterLink
             ></EmptyState
           >
@@ -173,7 +185,7 @@ const bars = computed(() => {
           <h2>最近事件</h2>
           <p>价格异动与采集异常，及时知晓</p>
         </div>
-        <RouterLink to="/events" class="text-link"
+        <RouterLink :to="areaPath('/events', adminArea)" class="text-link"
           >查看全部<Icon name="arrow" :size="14"
         /></RouterLink>
       </div>

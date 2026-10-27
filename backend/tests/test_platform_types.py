@@ -122,8 +122,11 @@ def test_unused_connection_can_change_type_and_resets_its_draft(db, admin_client
     saved.last_error = "old adapter failure"
     db.commit()
 
+    # This test changes the parser on the same synthetic source. A tested
+    # rule now binds its origin, so moving it to another site is a separate
+    # rejected operation rather than part of adapter-reset coverage.
     response = admin_client.put(f"/api/platforms/{platform['id']}", json=edit_payload(
-        platform, platform_type="yike", adapter="fans8", base_url="https://fans8.top"))
+        platform, platform_type="yike", adapter="fans8"))
     assert response.status_code == 200, response.text
     assert response.json()["platform_type"] == "yike"
     assert response.json()["adapter"] == "fans8"
@@ -142,6 +145,31 @@ def test_unused_connection_can_change_type_and_resets_its_draft(db, admin_client
         assert rule.config == default.json()
         assert rule.test_ok is False
         assert rule.tested_at is None
+
+
+def test_unused_connection_can_correct_source_after_unvalidated_adapter_reset(db, admin_client):
+    platform = create_platform(admin_client)
+    switched = admin_client.put(f"/api/platforms/{platform['id']}", json=edit_payload(
+        platform, platform_type="yike", adapter="fans8", base_url="https://fans8.top"))
+    assert switched.status_code == 200, switched.text
+    db.expire_all()
+    archived = db.scalar(select(Rule).where(Rule.platform_id == platform["id"], Rule.status == "archived"))
+    assert archived is not None
+    assert archived.test_ok is False
+    assert archived.tested_at is None
+
+    corrected = admin_client.put(f"/api/platforms/{platform['id']}", json=edit_payload(
+        switched.json(), base_url="https://corrected.example"))
+    assert corrected.status_code == 200, corrected.text
+    db.expire_all()
+    saved = db.get(Platform, platform["id"])
+    assert (saved.platform_type, saved.adapter, saved.base_url) == (
+        "yike", "fans8", "https://corrected.example")
+    assert saved.auth_status == "missing"
+    assert saved.encrypted_session is None
+    assert saved.active_rule_id is None
+    assert db.scalar(select(func.count()).select_from(CollectionRun)) == 0
+    assert db.scalar(select(func.count()).select_from(Rule)) == 2
 
 
 @pytest.mark.parametrize("lock_reason", ["session", "active_rule", "product_history"])
@@ -187,7 +215,7 @@ def test_publish_refreshes_a_rule_invalidated_while_waiting_for_platform_lock(db
     assert rule.test_ok is True  # Keep the pre-edit rule in this session's cache.
 
     edited = admin_client.put(f"/api/platforms/{platform['id']}", json=edit_payload(
-        platform, platform_type="yike", adapter="fans8", base_url="https://fans8.top"))
+        platform, platform_type="yike", adapter="fans8"))
     assert edited.status_code == 200, edited.text
     with pytest.raises(HTTPException) as caught:
         api.publish_rule(rule.id, db, None)
@@ -196,6 +224,24 @@ def test_publish_refreshes_a_rule_invalidated_while_waiting_for_platform_lock(db
     db.expire_all()
     assert db.get(Platform, platform["id"]).active_rule_id is None
     assert db.get(Rule, rule.id).test_ok is False
+
+
+def test_tested_draft_cannot_move_source_during_adapter_change(db, admin_client):
+    platform = create_platform(admin_client)
+    rule = db.scalar(select(Rule).where(Rule.platform_id == platform["id"]))
+    rule.test_ok, rule.tested_at = True, utcnow()
+    db.commit()
+
+    response = admin_client.put(f"/api/platforms/{platform['id']}", json=edit_payload(
+        platform, platform_type="yike", adapter="fans8", base_url="https://fans8.top"))
+    assert response.status_code == 409
+    db.expire_all()
+    saved = db.get(Platform, platform["id"])
+    assert (saved.platform_type, saved.adapter, saved.base_url) == (
+        "yile", "xiaohong66", platform["base_url"])
+    assert db.get(Rule, rule.id).status == "draft"
+    assert db.get(Rule, rule.id).test_ok is True
+    assert db.scalar(select(func.count()).select_from(Rule)) == 1
 
 
 def test_pending_adapter_can_be_saved_but_source_actions_stop_before_operation(db, admin_client, monkeypatch):

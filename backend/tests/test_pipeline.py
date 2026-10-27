@@ -5,6 +5,7 @@ Source HTTP is replaced with deterministic collector fixtures; no upstream traff
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -14,6 +15,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from threading import Event as ThreadEvent
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import dotenv_values
@@ -59,10 +61,17 @@ def isolated_database():
         raise RuntimeError("Refusing to run destructive test cleanup on any other database")
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
+        from app.ai_migrations import migrate_ai_center
+        migrate_ai_center(connection)
+        from app.category_tree import migrate_category_hierarchy
+        migrate_category_hierarchy(connection)
         connection.execute(text('ALTER TABLE platforms ADD COLUMN IF NOT EXISTS account_fingerprint VARCHAR(64)'))
         connection.execute(text("ALTER TABLE platforms ADD COLUMN IF NOT EXISTS platform_type VARCHAR(40) NOT NULL DEFAULT 'yile'"))
         connection.execute(text("ALTER TABLE platforms ADD COLUMN IF NOT EXISTS proxy_route VARCHAR(16) NOT NULL DEFAULT 'direct'"))
         connection.execute(text("ALTER TABLE update_runs ADD COLUMN IF NOT EXISTS pending_job JSON NOT NULL DEFAULT '{}'::json"))
+        connection.execute(text("ALTER TABLE canonical_products ADD COLUMN IF NOT EXISTS category_id INTEGER REFERENCES comparison_categories(id)"))
+        connection.execute(text("ALTER TABLE canonical_products ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''"))
+        connection.execute(text("ALTER TABLE canonical_products ADD COLUMN IF NOT EXISTS match_mode VARCHAR(16) NOT NULL DEFAULT 'exact'"))
     yield
     engine.dispose()
 
@@ -354,6 +363,58 @@ def test_daily_aggregation_uses_whole_utc_dates_and_excludes_invalid_quotes(db, 
     assert rows[0].minimum == Decimal("1")
     assert rows[0].maximum == Decimal("3")
     assert rows[0].average == Decimal("2")
+
+
+def test_dashboard_buckets_observations_at_beijing_midnight_with_utc_database(db, admin_client, monkeypatch):
+    from app import main as api
+
+    assert db.scalar(text('SHOW TIMEZONE')) == 'UTC'
+    fixed_now = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc)
+    platform, rule = platform_and_rule(db)
+    for index, observed in enumerate([
+        datetime(2026, 10, 24, 15, 59, 59, tzinfo=timezone.utc),
+        datetime(2026, 10, 24, 16, 0, tzinfo=timezone.utc),
+        datetime(2026, 10, 25, 15, 59, 59, tzinfo=timezone.utc),
+        datetime(2026, 10, 25, 16, 0, tzinfo=timezone.utc),
+    ]):
+        persist_page(db, run_for(db, platform, rule, offset=index), [source()], observed_at=observed)
+    db.commit()
+    monkeypatch.setattr(api, 'utcnow', lambda: fixed_now)
+
+    response = admin_client.get('/api/dashboard')
+    assert response.status_code == 200
+    assert response.json()['daily_counts'] == [
+        {'date': '2026-10-24', 'count': 1},
+        {'date': '2026-10-25', 'count': 2},
+        {'date': '2026-10-26', 'count': 1},
+    ]
+
+
+def test_history_declares_existing_daily_aggregates_as_utc_without_rewriting_them(db, admin_client, monkeypatch):
+    from app import main as api
+
+    fixed_now = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc)
+    platform, rule = platform_and_rule(db)
+    persist_page(db, run_for(db, platform, rule), [source()])
+    product = db.scalar(select(Product))
+    aggregate = DailyAggregate(product_id=product.id, day='2026-10-24', unit='人', currency='CNY',
+        display_quantity=Decimal('1000'), minimum=Decimal('1'), maximum=Decimal('3'),
+        average=Decimal('2'), count=2)
+    db.add(aggregate)
+    db.commit()
+    monkeypatch.setattr(api, 'utcnow', lambda: fixed_now)
+
+    response = admin_client.get(f'/api/products/{product.id}/history?days=7')
+    assert response.status_code == 200
+    data = response.json()
+    assert data['daily_timezone'] == 'UTC'
+    assert len(data['daily']) == 1
+    assert data['daily'][0]['date'] == '2026-10-24'
+    assert data['daily'][0]['count'] == 2
+    assert Decimal(data['daily'][0]['min']) == Decimal('1')
+    assert Decimal(data['daily'][0]['max']) == Decimal('3')
+    db.expire_all()
+    assert db.get(DailyAggregate, aggregate.id).day == '2026-10-24'
 
 
 @pytest.mark.parametrize("warning", ["unit_requires_review", "invalid_stock"])
@@ -840,3 +901,134 @@ def test_manual_collection_advances_due_time_and_scheduler_does_not_create_secon
     assert db.scalar(select(func.count()).select_from(CollectionRun)) == 1
     assert dispatched == [run_id]
     assert result["dispatched"] == 0
+
+
+@pytest.mark.parametrize("first_entry", ["manual", "scheduler"])
+def test_manual_and_scheduler_planning_share_a_transaction_lock(db, first_entry):
+    platform, _ = platform_and_rule(db)
+    planning_time = utcnow()
+    platform.next_due_at = planning_time-timedelta(minutes=5)
+    db.commit()
+    loaded = ThreadEvent()
+    contender = {}
+
+    def second_planner():
+        with SessionLocal() as other:
+            candidate = other.get(Platform, platform.id)
+            contender["pid"] = other.scalar(text('SELECT pg_backend_pid()'))
+            loaded.set()
+            kwargs = {"due_at": planning_time} if first_entry == "manual" else {}
+            run = tasks.queue_run(other, candidate, **kwargs)
+            if run is not None and first_entry == "scheduler":
+                candidate.next_due_at = max(candidate.next_due_at,
+                    run.scheduled_at+timedelta(seconds=candidate.interval_seconds))
+            run_id = run.id if run is not None else None
+            other.commit()
+            return run_id
+
+    with SessionLocal() as first, ThreadPoolExecutor(max_workers=1) as executor:
+        candidate = first.get(Platform, platform.id)
+        kwargs = {"due_at": planning_time} if first_entry == "scheduler" else {}
+        planned = tasks.queue_run(first, candidate, **kwargs)
+        candidate.next_due_at = planned.scheduled_at+timedelta(seconds=candidate.interval_seconds)
+        first.flush()
+        future = executor.submit(second_planner)
+        try:
+            assert loaded.wait(5), "The competing planner did not start"
+            # Observe a real PostgreSQL lock wait rather than inferring one
+            # solely from a short sleep or mocking query results.
+            waiting = False
+            deadline = time.monotonic()+5
+            with engine.connect() as observer:
+                while time.monotonic() < deadline and not future.done():
+                    waiting = bool(observer.scalar(text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=:pid "
+                        "AND locktype='advisory' AND NOT granted)"), {"pid": contender["pid"]}))
+                    if waiting:
+                        break
+                    time.sleep(0.01)
+            assert waiting, "Both collection entry points must wait on the same platform planning lock"
+        finally:
+            first.commit()
+        second_id = future.result(timeout=10)
+    db.expire_all()
+    assert db.scalar(select(func.count()).select_from(CollectionRun)) == 1
+    assert second_id == (None if first_entry == "manual" else planned.id)
+    assert db.get(Platform, platform.id).next_due_at == planned.scheduled_at+timedelta(seconds=platform.interval_seconds)
+
+
+@pytest.mark.parametrize("change", ["disabled", "expired", "rescheduled", "unpublished"])
+def test_scheduler_rechecks_stale_platform_eligibility_after_planning_lock(db, change):
+    platform, _ = platform_and_rule(db)
+    platform.next_due_at = utcnow()-timedelta(minutes=5)
+    db.commit()
+    now = utcnow()
+    with SessionLocal() as writer:
+        current = writer.get(Platform, platform.id)
+        if change == "disabled":
+            current.enabled = False
+        elif change == "expired":
+            current.auth_status = "expired"
+        elif change == "rescheduled":
+            current.next_due_at = now+timedelta(hours=1)
+        else:
+            current.active_rule_id = None
+        writer.commit()
+    assert tasks.queue_run(db, platform, due_at=now) is None
+    assert db.scalar(select(func.count()).select_from(CollectionRun)) == 0
+
+
+@pytest.mark.parametrize("binding", ["session", "fingerprint", "published_rule", "tested_rule", "run", "product"])
+def test_bound_platform_cannot_change_source_origin(db, admin_client, binding):
+    platform = Platform(name="绑定来源", base_url="https://www.xiaohong66.com")
+    db.add(platform)
+    db.flush()
+    rule = Rule(platform_id=platform.id, version=1, config={}, status="draft")
+    db.add(rule)
+    db.flush()
+    if binding == "session":
+        platform.encrypted_session = encrypt_session("fixed-session-not-a-real-credential")
+    elif binding == "fingerprint":
+        platform.account_fingerprint = "a"*64
+    elif binding == "published_rule":
+        rule.status = "published"
+        platform.active_rule_id = rule.id
+    elif binding == "tested_rule":
+        rule.tested_at, rule.test_ok = utcnow(), True
+    else:
+        run = run_for(db, platform, rule)
+        if binding == "product":
+            persist_page(db, run, [source()])
+    db.commit()
+    response = admin_client.put(f"/api/platforms/{platform.id}", json={
+        "name": platform.name, "base_url": "https://other.example", "account_label": platform.account_label,
+    })
+    assert response.status_code == 409
+    db.expire_all()
+    assert db.get(Platform, platform.id).base_url == "https://www.xiaohong66.com"
+
+
+def test_unused_platform_with_initial_draft_can_correct_source_origin(db, admin_client):
+    created = admin_client.post("/api/platforms", json={
+        "name": "初始地址", "base_url": "https://original.example",
+    })
+    assert created.status_code == 200
+    response = admin_client.put(f"/api/platforms/{created.json()['id']}", json={
+        "name": "初始地址", "base_url": "https://corrected.example",
+    })
+    assert response.status_code == 200
+    assert response.json()["base_url"] == "https://corrected.example"
+
+
+def test_bound_yile_platform_allows_verified_native_origin_alias(db, admin_client):
+    platform, _ = platform_and_rule(db)
+    platform.base_url = "https://www.xiaohong66.com"
+    db.commit()
+    response = admin_client.put(f"/api/platforms/{platform.id}", json={
+        "name": platform.name, "base_url": "https://xiaohong66.com", "account_label": platform.account_label,
+    })
+    assert response.status_code == 200
+    db.expire_all()
+    assert db.get(Platform, platform.id).base_url == "https://xiaohong66.com"
+    # A fresh session is still required after the address is edited.
+    assert db.get(Platform, platform.id).auth_status == "missing"

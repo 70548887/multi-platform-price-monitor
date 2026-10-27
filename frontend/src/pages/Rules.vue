@@ -127,7 +127,7 @@ function choose(rule: any) {
 }
 </script>
 <template>
-  <RouterLink to="/platforms" class="back-link"
+  <RouterLink to="/admin/platforms" class="back-link"
     ><Icon name="back" :size="16" />返回平台管理<span v-if="platform">
       / {{ platform.name }}</span
     ></RouterLink
@@ -140,7 +140,7 @@ function choose(rule: any) {
   </div>
   <div v-if="notice" class="notice success">
     {{ notice
-    }}<RouterLink v-if="platform?.active_rule_id" to="/platforms" class="text-link"
+    }}<RouterLink v-if="platform?.active_rule_id" to="/admin/platforms" class="text-link"
       >返回平台采集 →</RouterLink
     >
   </div>
@@ -164,7 +164,7 @@ function choose(rule: any) {
       </div>
       <RouterLink
         v-if="platform.auth_status !== 'connected'"
-        to="/platforms"
+        to="/admin/platforms"
         class="btn btn-white btn-sm"
         >连接账号</RouterLink
       >

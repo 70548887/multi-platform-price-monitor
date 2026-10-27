@@ -205,3 +205,53 @@ async def test_sync_and_async_progress_callbacks_receive_bounded_stream_progress
         sync_progress = []
         await github.download(info, tmp_path / "sync", progress_callback=lambda size, total: sync_progress.append((size, total)))
         assert sync_progress == progress
+
+
+@pytest.mark.asyncio
+async def test_owned_clients_keep_proxy_across_release_checksum_and_redirects(tmp_path, monkeypatch):
+    import app.update_github as module
+    original_client = httpx.AsyncClient
+    observed_options, requests = [], []
+    digest = hashlib.sha256(PACKAGE).hexdigest()
+    def handler(request):
+        requests.append(request)
+        path = request.url.path
+        if path.endswith('/releases/latest'):
+            return httpx.Response(200, json=release_json())
+        if request.url.host == 'api.github.com':
+            number = path.rsplit('/', 1)[-1]
+            return httpx.Response(302, headers={'Location': 'https://release-assets.githubusercontent.com/' + number})
+        assert 'Authorization' not in request.headers
+        if path == '/42':
+            return httpx.Response(200, content=(digest + '  ' + ASSET + '\n').encode())
+        return httpx.Response(200, content=PACKAGE)
+    def factory(**options):
+        observed_options.append(options)
+        return original_client(transport=httpx.MockTransport(handler), follow_redirects=False, trust_env=False)
+    monkeypatch.setattr(module.httpx, 'AsyncClient', factory)
+    settings = UpdateConfig(root=tmp_path, proxy='http://fixture:private@proxy.example:8080', github_token='fixture-token')
+    github = GitHubReleaseClient(settings)
+    release = await github.check('1.1.0')
+    downloaded = await github.download(release, tmp_path / 'package')
+    assert downloaded.sha256 == digest
+    assert len(observed_options) >= 3
+    assert all(option['proxy'] == settings.proxy and option['trust_env'] is False for option in observed_options)
+    assert any(request.url.host == 'release-assets.githubusercontent.com' for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_proxy_connection_failure_does_not_retry_direct(tmp_path, monkeypatch):
+    import app.update_github as module
+    original_client = httpx.AsyncClient
+    routes = []
+    def handler(request):
+        raise httpx.ProxyError('fixture-proxy-private-password', request=request)
+    def factory(**options):
+        routes.append(options.get('proxy'))
+        return original_client(transport=httpx.MockTransport(handler), trust_env=False)
+    monkeypatch.setattr(module.httpx, 'AsyncClient', factory)
+    with pytest.raises(UpdateError) as error:
+        await GitHubReleaseClient(UpdateConfig(root=tmp_path, proxy='http://fixture:private@proxy.example:8080')).check('1.1.0')
+    assert len(routes) == 1 and routes[0]
+    assert error.value.code == 'github_connection_failed'
+    assert 'private' not in error.value.message

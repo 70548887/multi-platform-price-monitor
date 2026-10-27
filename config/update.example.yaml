@@ -1,5 +1,6 @@
 # Copy to config/update.yaml for local deployment.
-# Keep credentials in UPDATE_GITHUB_TOKEN and UPDATE_PROXY environment variables.
+# Use encrypted system settings for overseas mode; UPDATE_PROXY only applies to custom mode.
+# Keep the GitHub Token in UPDATE_GITHUB_TOKEN.
 update:
   enabled: true
   github_owner: "70548887"
@@ -7,6 +8,7 @@ update:
   github_token: "${UPDATE_GITHUB_TOKEN:-}"
   check_interval: 0
   proxy: "${UPDATE_PROXY:-}"
+  proxy_route: "overseas"              # overseas: system settings; custom: UPDATE_PROXY; direct: no proxy
   auto_download: false
   auto_restart: true
   backup_dir: "./data/backups"

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onMounted, ref, watch, computed } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch, computed } from 'vue'
 import { useRoute } from 'vue-router'
+import { areaPath } from '../navigation'
 import {
   api,
   itemsOf,
@@ -21,6 +22,7 @@ const route = useRoute(),
   product = ref<any>(null),
   points = ref<any[]>([]),
   daily = ref<any[]>([]),
+  dailyTimezone = ref('UTC'),
   resolution = ref('hour'),
   events = ref<any[]>([]),
   days = ref(7),
@@ -33,20 +35,33 @@ let request = 0
 async function history() {
   const n = ++request
   chartLoading.value = true
+  error.value = ''
   try {
     const result = await api(`/products/${route.params.id}/history?days=${days.value}`)
     if (n === request) {
       intervalSeconds.value = result.interval_seconds ?? product.value?.interval_seconds
       points.value = itemsOf(result)
       daily.value = result.daily ?? []
+      dailyTimezone.value = result.daily_timezone ?? 'UTC'
       events.value = result.events ?? []
     }
   } catch (e: any) {
-    error.value = e.message
+    if (n === request) {
+      error.value = e.message
+      if ([401, 403, 404].includes(e.status)) {
+        product.value = null
+        points.value = []
+        daily.value = []
+        events.value = []
+      }
+    }
   } finally {
     if (n === request) chartLoading.value = false
   }
 }
+onBeforeUnmount(() => {
+  request++
+})
 onMounted(async () => {
   try {
     product.value = await api(`/products/${route.params.id}`)
@@ -100,7 +115,7 @@ const basisChanged = computed(
 )
 </script>
 <template>
-  <RouterLink to="/products" class="back-link"
+  <RouterLink :to="areaPath('/products', Boolean(route.meta?.admin))" class="back-link"
     ><Icon name="back" :size="16" />返回商品中心</RouterLink
   >
   <div v-if="error" class="notice error">{{ error }}</div>
@@ -172,14 +187,18 @@ const basisChanged = computed(
         <div>
           <h2>价格走势</h2>
           <p>
-            {{ resolution === 'daily' ? '每日最低、均价与最高价格' : '小时采样价格' }} ·
-            缺失、停售和计价条件变化时保留断点
+            {{
+              resolution === 'daily'
+                ? `${dailyTimezone} 自然日的最低、均价与最高价格`
+                : '小时采样价格'
+            }}
+            · 缺失、停售和计价条件变化时保留断点
           </p>
         </div>
         <div class="chart-controls">
           <select v-model="resolution" aria-label="采样粒度">
             <option value="hour">小时采样</option>
-            <option value="daily">日聚合</option></select
+            <option value="daily">日聚合（{{ dailyTimezone }} 自然日）</option></select
           ><select v-model="display" :disabled="resolution === 'daily'" aria-label="价格口径">
             <option :value="false">基础单价</option>
             <option :value="true">展示价格</option></select

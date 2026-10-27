@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import { areaPath } from '../navigation'
 import { api, itemsOf, params, json, auth, date, statusLabel } from '../api'
 import Icon from '../components/Icon.vue'
+const route = useRoute()
+const adminArea = computed(() => Boolean(route.meta?.admin))
 import Badge from '../components/Badge.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Pagination from '../components/Pagination.vue'
@@ -13,7 +17,7 @@ const events = ref<any[]>([]),
   page = ref(1),
   total = ref(0),
   busy = ref<number | null>(null),
-  admin = computed(() => auth.user?.role === 'admin')
+  admin = computed(() => auth.user?.role === 'admin' && adminArea.value)
 let request = 0
 async function load() {
   const n = ++request
@@ -43,6 +47,7 @@ function changePage(p: number) {
   load()
 }
 async function ack(event: any) {
+  if (!admin.value) return
   busy.value = event.id
   error.value = ''
   try {
@@ -112,7 +117,9 @@ async function ack(event: any) {
           <div class="event-row-meta">
             <span>{{ date(event.created_at) }}</span
             ><span v-if="event.platform_name">{{ event.platform_name }}</span
-            ><RouterLink v-if="event.product_id" :to="`/products/${event.product_id}`"
+            ><RouterLink
+              v-if="event.product_id"
+              :to="areaPath(`/products/${event.product_id}`, adminArea)"
               >查看商品 →</RouterLink
             >
           </div>

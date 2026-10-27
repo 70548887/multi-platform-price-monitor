@@ -1,12 +1,19 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
-import { api, itemsOf, params, price, displayBasisLabel, date, qualityText } from '../api'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import { areaPath } from '../navigation'
+import { api, auth, itemsOf, params, price, displayBasisLabel, date, qualityText } from '../api'
 import Icon from '../components/Icon.vue'
+const route = useRoute()
+const adminArea = computed(() => Boolean(route.meta?.admin))
 import Badge from '../components/Badge.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Pagination from '../components/Pagination.vue'
 const products = ref<any[]>([]),
   platforms = ref<any[]>([]),
+  platformsLoaded = ref(false),
+  categories = ref<any[]>([]),
+  categoryError = ref(''),
   loading = ref(true),
   error = ref(''),
   q = ref(''),
@@ -17,7 +24,12 @@ const products = ref<any[]>([]),
   total = ref(0),
   pageSize = 20
 let request = 0,
+  categoryRequest = 0,
+  disposed = false,
   timer: ReturnType<typeof setTimeout>
+const noAssignedPlatforms = computed(
+  () => auth.user?.role === 'viewer' && platformsLoaded.value && !platforms.value.length,
+)
 async function load() {
   const current = ++request
   loading.value = true
@@ -36,11 +48,39 @@ async function load() {
     if (current === request) loading.value = false
   }
 }
-watch([platform, status], () => {
+const categoryOptions = computed(() => {
+  const grouped = new Map<string, number>()
+  for (const item of categories.value) {
+    if (item.category_name)
+      grouped.set(item.category_name, (grouped.get(item.category_name) ?? 0) + item.product_count)
+  }
+  return [...grouped].map(([name, count]) => ({ name, count }))
+})
+async function loadCategories() {
+  const id = ++categoryRequest
+  categoryError.value = ''
+  try {
+    const result = await api(`/product-categories${params({ platform_id: platform.value })}`)
+    if (id === categoryRequest && !disposed) categories.value = itemsOf(result)
+  } catch (e: any) {
+    if (id === categoryRequest && !disposed) {
+      categories.value = []
+      categoryError.value = e.message
+    }
+  }
+}
+watch(platform, () => {
+  category.value = ''
+  page.value = 1
+  categories.value = []
+  loadCategories()
+  load()
+})
+watch([status, category], () => {
   page.value = 1
   load()
 })
-watch([q, category], () => {
+watch(q, () => {
   clearTimeout(timer)
   timer = setTimeout(() => {
     page.value = 1
@@ -50,10 +90,22 @@ watch([q, category], () => {
 onMounted(async () => {
   await Promise.all([
     load(),
+    loadCategories(),
     api('/platforms')
-      .then((result) => (platforms.value = itemsOf(result)))
+      .then((result) => {
+        if (!disposed) {
+          platforms.value = itemsOf(result)
+          platformsLoaded.value = true
+        }
+      })
       .catch(() => {}),
   ])
+})
+onBeforeUnmount(() => {
+  disposed = true
+  request++
+  categoryRequest++
+  clearTimeout(timer)
 })
 function changePage(p: number) {
   page.value = p
@@ -62,6 +114,9 @@ function changePage(p: number) {
 </script>
 <template>
   <section class="panel">
+    <div v-if="noAssignedPlatforms" class="notice warning inset">
+      尚未分配平台，请联系管理员为当前成员分配可查看的平台。
+    </div>
     <div class="panel-toolbar">
       <div class="search-input">
         <Icon name="search" :size="17" /><input
@@ -78,13 +133,17 @@ function changePage(p: number) {
           <option value="">全部销售状态</option>
           <option value="active">在售</option>
           <option value="closed">停售</option></select
-        ><input
-          v-model="category"
-          class="category-filter"
-          placeholder="分类名称"
-          aria-label="筛选分类（精确名称）"
-        /><span class="result-count">{{ total.toLocaleString() }} 个商品</span>
+        ><select v-model="category" class="category-filter" aria-label="筛选源平台类目">
+          <option value="">全部源平台类目</option>
+          <option v-for="item in categoryOptions" :key="item.name" :value="item.name">
+            {{ item.name }}（{{ item.count }}）
+          </option></select
+        ><span class="result-count">{{ total.toLocaleString() }} 个商品</span>
       </div>
+    </div>
+    <div v-if="categoryError" class="notice warning inset">
+      源平台类目读取失败：{{ categoryError
+      }}<button class="text-link" @click="loadCategories">重试</button>
     </div>
     <div v-if="error" class="notice error inset">
       {{ error }}<button class="text-link" @click="load">重新加载</button>
@@ -106,7 +165,9 @@ function changePage(p: number) {
         <tbody>
           <tr v-for="p in products" :key="p.id">
             <td>
-              <RouterLink class="product-name" :to="`/products/${p.id}`">{{ p.name }}</RouterLink>
+              <RouterLink class="product-name" :to="areaPath(`/products/${p.id}`, adminArea)">{{
+                p.name
+              }}</RouterLink>
               <div class="table-secondary">
                 <span class="mono">#{{ p.source_id }}</span
                 ><span v-if="p.category_name" class="dot-separator">{{ p.category_name }}</span>
@@ -114,7 +175,9 @@ function changePage(p: number) {
             </td>
             <td>
               <span>{{ p.platform_name }}</span>
-              <div class="table-secondary">{{ p.account_label ?? '默认账号' }}</div>
+              <div v-if="adminArea" class="table-secondary">
+                {{ p.account_label ?? '默认账号' }}
+              </div>
             </td>
             <td>
               <strong class="price-text">{{ price(p.price, p.currency) }}</strong
@@ -137,7 +200,10 @@ function changePage(p: number) {
               <div v-if="p.freshness === 'stale'" class="quality-warning">数据已过期</div>
             </td>
             <td>
-              <RouterLink :to="`/products/${p.id}`" class="table-action" aria-label="查看商品"
+              <RouterLink
+                :to="areaPath(`/products/${p.id}`, adminArea)"
+                class="table-action"
+                aria-label="查看商品"
                 ><Icon name="arrow" :size="17"
               /></RouterLink>
             </td>
@@ -150,11 +216,13 @@ function changePage(p: number) {
         :description="
           q || platform || status || category
             ? '试试其他关键词或调整筛选条件。'
-            : '请先添加平台并完成首次采集，商品与价格将自动汇总。'
+            : adminArea
+              ? '请先添加平台并完成首次采集，商品与价格将自动汇总。'
+              : '暂无可查看商品，请联系管理员分配平台或等待采集完成。'
         "
         ><RouterLink
-          v-if="!q && !platform && !status && !category"
-          to="/platforms"
+          v-if="adminArea && !q && !platform && !status && !category"
+          to="/admin/platforms"
           class="btn btn-primary btn-sm"
           >管理平台</RouterLink
         ></EmptyState

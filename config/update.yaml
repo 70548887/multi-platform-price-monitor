@@ -6,6 +6,7 @@ update:
   github_token: "${UPDATE_GITHUB_TOKEN:-}"
   check_interval: 0
   proxy: "${UPDATE_PROXY:-}"
+  proxy_route: "overseas"              # reuse the encrypted overseas proxy in system settings
   auto_download: false
   auto_restart: true
   backup_dir: "./data/backups"

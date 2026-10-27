@@ -156,7 +156,7 @@ async function open(platform?: any) {
   if (platform && !platformIdentityLocked(platform) && platform.type_locked === undefined) {
     checkingIdentity.value = true
     try {
-      const rules = await api(`/platforms/${platform.id}/rules`)
+      const rules = await api(`/admin/platforms/${platform.id}/rules`)
       if (editing.value?.id === platform.id)
         hasPublishedRules.value = itemsOf(rules).some((rule) => rule.status === 'published')
     } catch {
@@ -401,7 +401,7 @@ function proxyLabel(value: string | undefined) {
           <Icon name="key" :size="14" />{{
             platform.auth_status === 'missing' ? '连接账号' : '更新会话'
           }}</button
-        ><RouterLink :to="`/platforms/${platform.id}/rules`" class="btn btn-white btn-sm"
+        ><RouterLink :to="`/admin/platforms/${platform.id}/rules`" class="btn btn-white btn-sm"
           >规则</RouterLink
         ><button class="icon-btn" title="编辑平台" aria-label="编辑平台" @click="open(platform)">
           <Icon name="edit" :size="17" />
@@ -537,7 +537,7 @@ function proxyLabel(value: string | undefined) {
         </select>
         <small
           >按平台选择出口，代理地址在
-          <RouterLink to="/settings/network">系统设置</RouterLink>
+          <RouterLink to="/admin/settings/network">系统设置</RouterLink>
           中维护。所选代理未配置或停用时，需要先启用代理。</small
         >
       </label>

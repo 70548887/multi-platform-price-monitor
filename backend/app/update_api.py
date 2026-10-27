@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .db import get_db
-from .models import CollectionRun, UpdateRun
+from .models import AIAnalysisRun, CollectionRun, UpdateRun
 from .security import admin_user, current_user
 from . import update_service as service
 from .version import VERSION
@@ -31,8 +31,8 @@ def version(user=Depends(current_user)):
 
 
 @router.get('/api/update/config')
-def configuration(user=Depends(admin_user)):
-    return service.update_config().public_dict()
+def configuration(db: Session = Depends(get_db), user=Depends(admin_user)):
+    return service.public_network_config(service.update_config(), db)
 
 
 @router.get('/api/update/status')
@@ -75,15 +75,18 @@ def history(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)
 @router.get('/api/update/host/drain', include_in_schema=False)
 def drain(proof: str = Header(default='', alias='X-Update-Host-Proof'), db: Session = Depends(get_db)):
     service.verify_host_proof(proof, 'drain')
-    running = db.scalar(select(func.count()).select_from(CollectionRun).where(CollectionRun.status == 'running'))
+    collection_running = db.scalar(select(func.count()).select_from(CollectionRun).where(CollectionRun.status == 'running'))
+    ai_running = db.scalar(select(func.count()).select_from(AIAnalysisRun).where(AIAnalysisRun.status == 'running'))
+    running = collection_running + ai_running
     queued = db.scalar(select(func.count()).select_from(CollectionRun).where(CollectionRun.status == 'queued'))
-    return {'running': running, 'queued': queued, 'ready': running == 0}
+    return {'running': running, 'collection_running': collection_running, 'ai_running': ai_running,
+            'queued': queued, 'ready': running == 0}
 
 
 @router.get('/api/update/host/health', include_in_schema=False)
 def host_health(proof: str = Header(default='', alias='X-Update-Host-Proof'), db: Session = Depends(get_db)):
     service.verify_host_proof(proof, 'health')
-    checks = {'database': False, 'redis': False, 'worker': False, 'beat': False}
+    checks = {'database': False, 'redis': False, 'worker': False, 'ai_worker': False, 'beat': False}
     try:
         db.execute(select(1))
         checks['database'] = True
@@ -94,11 +97,17 @@ def host_health(proof: str = Header(default='', alias='X-Update-Host-Proof'), db
         checks['redis'] = bool(rc.ping())
         beat_at = rc.get('pm:beat:heartbeat')
         checks['beat'] = bool(beat_at and 0 <= __import__('time').time() - float(beat_at) <= 180)
+        from .ai_worker import AI_HEARTBEAT_KEY, heartbeat_fresh
+        checks['ai_worker'] = heartbeat_fresh(rc.get(AI_HEARTBEAT_KEY))
     except Exception:
         pass
     try:
         from .tasks import celery_app
-        checks['worker'] = bool(celery_app.control.inspect(timeout=3).ping())
+        replies = celery_app.control.inspect(timeout=3).ping() or {}
+        # A healthy AI worker must not hide a missing collection worker.
+        checks['worker'] = any(name.startswith(('collector@', 'worker@', 'celery@'))
+                               and response.get('ok') == 'pong' for name, response in replies.items()
+                               if isinstance(name, str) and isinstance(response, dict))
     except Exception:
         pass
     return {'status': 'ok' if all(checks.values()) else 'degraded', 'version': VERSION, **checks}
