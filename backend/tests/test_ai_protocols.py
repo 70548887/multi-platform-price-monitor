@@ -38,7 +38,7 @@ def test_responses_request_uses_native_input_reasoning_and_no_storage():
     assert path=='/responses' and headers['Authorization']=='Bearer '+KEY
     assert body=={'model':'fixture-model','instructions':'s','input':[{'role':'user','content':'p'}],
                  'store':False,'max_output_tokens':4000,'reasoning':{'effort':'xhigh'},
-                 'text':{'format':{'type':'json_object'}}}
+                 'text':{'format':{'type':'json_schema','name':'price_data_report','strict':True,'schema':SCHEMA}}}
     _,_,plain=build_request(connection(api_format='responses',json_mode=False),'p','s',SCHEMA)
     assert 'reasoning' not in plain and 'text' not in plain
 

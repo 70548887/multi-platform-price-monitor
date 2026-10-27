@@ -97,6 +97,22 @@ def run_analysis(user=Depends(admin_user)):
         return JSONResponse({'detail':exc.message,'error_code':exc.code},status_code=409)
 
 
+class OrganizeInput(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    limit:Annotated[int,Field(strict=True,ge=1,le=100)]=20
+    group_id:Annotated[int,Field(strict=True,gt=0)]|None=None
+
+
+@router.post('/organize',status_code=202)
+def organize(body:OrganizeInput,user=Depends(admin_user)):
+    try:
+        run=create_analysis(user.id,purpose='organize',limit=body.limit,group_id=body.group_id)
+        dispatch_analysis(run)
+        return run
+    except AnalysisError as exc:
+        return JSONResponse({'detail':exc.message,'error_code':exc.code},status_code=409)
+
+
 @router.get('/preview')
 def preview(db:Session=Depends(get_db),user=Depends(admin_user)):
     settings=db.get(AISettings,1) or SimpleNamespace(sample_limit=100)

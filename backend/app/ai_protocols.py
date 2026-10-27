@@ -15,6 +15,22 @@ OPENAI_EFFORTS = frozenset(('auto', 'none', 'minimal', 'low', 'medium', 'high', 
 ANTHROPIC_EFFORTS = frozenset(('auto', 'low', 'medium', 'high', 'xhigh', 'max'))
 
 
+def strict_report_schema(schema):
+    """All object fields are required by strict outputs; nullable fields retain null."""
+    result=deepcopy(schema)
+    def visit(node):
+        if isinstance(node,dict):
+            node.pop('default',None)
+            if node.get('type')=='object':
+                node['additionalProperties']=False
+                node['required']=list(node.get('properties',{}))
+            for value in list(node.values()):visit(value)
+        elif isinstance(node,list):
+            for item in node:visit(item)
+    visit(result)
+    return result
+
+
 class ProtocolResponseError(ValueError):
     """Only fixed messages/codes may cross the protocol boundary."""
     def __init__(self, code='AI_REPORT_INVALID', message='AI 返回的报告格式无效，未应用分析结论'):
@@ -68,7 +84,8 @@ def build_request(connection, payload: str, system_prompt: str, report_schema: d
         if effort != 'auto':
             body['reasoning'] = {'effort': effort}
         if connection.json_mode:
-            body['text'] = {'format': {'type': 'json_object'}}
+            body['text'] = {'format': {'type': 'json_schema','name':'price_data_report',
+                                     'strict':True,'schema':strict_report_schema(report_schema)}}
         return '/responses', headers, body
     token_field = 'max_completion_tokens' if re.match(r'^(?:gpt-[5-9](?:\.|-|$)|o[1-9](?:-|$))', connection.model) else 'max_tokens'
     body = {'model': connection.model,

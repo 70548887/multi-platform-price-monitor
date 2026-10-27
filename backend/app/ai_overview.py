@@ -12,6 +12,7 @@ from .ai_diagnostics import issue_description
 
 
 def overview(db):
+    from .ai_suggestions import organize_candidates
     now=utcnow();local=now.astimezone(BEIJING);day=day_key(now)
     settings=db.get(AISettings,1);config=public_ai_settings(settings)
     quota=db.get(AIDailyQuota,day)
@@ -60,4 +61,6 @@ def overview(db):
                  'findings':sum(len(b.report.get('findings',[])) for b in batches)},
         'coverage':{'total':total,'checked':checked,'remaining':max(0,total-checked)},
         'pending_suggestions':db.scalar(select(func.count()).select_from(AISuggestion).where(AISuggestion.status=='pending')),
-        'worker':worker,'last_issue':last_issue}
+        'worker':worker,'last_issue':last_issue,
+        'unorganized_count':db.scalar(select(func.count()).select_from(Product).where(Product.canonical_id.is_(None))),
+        'organizable_count':len(organize_candidates(db))}

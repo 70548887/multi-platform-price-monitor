@@ -53,7 +53,8 @@ async def test_protocol_roundtrip_keeps_report_contract_and_auth_boundary(api_fo
             return httpx.Response(200,json={'choices':[{'message':{'role':'assistant','content':json.dumps(expected)},'finish_reason':'stop'}]})
         if api_format=='responses':
             assert body['reasoning']=={'effort':'medium'} and body['store'] is False
-            assert body['text']['format']['type']=='json_object'
+            assert body['text']['format']['type']=='json_schema'
+            assert body['text']['format']['strict'] is True
             return httpx.Response(200,json={'status':'completed','output':[{'type':'reasoning','summary':[{'type':'summary_text','text':'internal-do-not-store'}]},
                 {'type':'message','role':'assistant','content':[{'type':'output_text','text':json.dumps(expected)}]}],
                 'usage':{'input_tokens':10,'output_tokens':5,'total_tokens':15}})

@@ -58,6 +58,15 @@ def propose(db, products, *, auto=False, path='抖音 / 视频', name='抖音视
     return rows[0]
 
 
+def context_for(db, batch, target, classification):
+    canonical=db.get(CanonicalProduct,target['id'])
+    batch.snapshot={**batch.snapshot,
+        'comparison_categories':[{'id':classification['id'],'path':'抖音 / '+classification['name']}],
+        'existing_comparison_groups':[{**suggestions._target_identity(canonical),
+                                     'category_path':'抖音 / '+classification['name']}]}
+    return canonical
+
+
 def test_automatic_create_keeps_source_facts_and_undo_is_durable(db, admin_client):
     classification = catalogue(admin_client)
     products = source_products(db)
@@ -283,3 +292,137 @@ def test_automatic_pinned_target_is_rechecked_and_never_silently_replaced(db, ad
     assert row.group_id == target['id']
     assert all(product.canonical_id is None for product in products)
     assert db.scalar(select(func.count()).select_from(AIApplication)) == 0
+
+
+def test_organize_explicit_general_existing_group_preserves_unknown_quantity(db,admin_client):
+    root=category(admin_client,'抖音')
+    classification=category(admin_client,'综合互动',parent_id=root['id'])
+    target=group(admin_client,name='抖音点赞',category_id=classification['id'],match_mode='similar')
+    products=source_products(db,('DY协议秒赞','DY真人作品点赞'))
+    for product in products:
+        product.category_name='协议点赞';product.unit='';product.display_quantity=Decimal('0')
+        product.quality=['unit_requires_review']
+    db.commit()
+    original=[(p.price,p.display_quantity,p.unit,p.category_name) for p in products]
+    run,batch=batch_for(db,products)
+    run.purpose='organize'
+    context_for(db,batch,target,classification)
+    report={'category_suggestions':[{'product_id':p.id,'group_id':target['id'],
+             'category_id':classification['id'],'category_path':'抖音 / 综合互动',
+             'group_name':'抖音点赞','reason':'明确抖音单一点赞动作，已有宽范围类目'} for p in products]}
+    rows=suggestions.ingest_suggestions(db,run,batch,report,auto_apply=True)
+    db.commit()
+    assert all(row.status=='applied' for row in rows)
+    assert all(p.canonical_id==target['id'] for p in products)
+    assert original==[(p.price,p.display_quantity,p.unit,p.category_name) for p in products]
+    assert db.scalar(select(func.count()).select_from(CanonicalProduct))==1
+
+
+@pytest.mark.parametrize('problem',['missing_group','unknown_group','foreign_category','changed_target'])
+def test_organize_only_targets_existing_group_in_input_context(db,admin_client,problem):
+    classification=catalogue(admin_client)
+    target=group(admin_client,name='抖音视频点赞',category_id=classification['id'],match_mode='similar')
+    products=source_products(db)
+    run,batch=batch_for(db,products);run.purpose='organize'
+    canonical=context_for(db,batch,target,classification)
+    proposal={'name':'抖音视频点赞','category_path':'抖音 / 视频','product_ids':[p.id for p in products],
+              'group_id':target['id'],'category_id':classification['id'],'reason':'固定测试'}
+    if problem=='missing_group':proposal['group_id']=None
+    elif problem=='unknown_group':proposal['group_id']=target['id']+999
+    elif problem=='foreign_category':proposal['category_id']=classification['id']+999
+    else:
+        canonical.description='目录快照之后被管理员调整';db.flush()
+    rows=suggestions.ingest_suggestions(db,run,batch,{'group_suggestions':[proposal]},auto_apply=True)
+    db.commit()
+    assert len(rows)==1 and rows[0].status=='pending' and rows[0].blocked_reason
+    assert all(p.canonical_id is None for p in products)
+    assert db.scalar(select(func.count()).select_from(AIApplication))==0
+    assert db.scalar(select(func.count()).select_from(CanonicalProduct))==1
+
+
+def test_general_target_does_not_make_video_only_target_accept_unspecified_scene(db,admin_client):
+    classification=catalogue(admin_client)
+    target=group(admin_client,name='抖音视频点赞',category_id=classification['id'],match_mode='similar')
+    products=source_products(db,('DY协议秒赞','DY作品点赞'))
+    for product in products:product.category_name='协议点赞'
+    db.commit()
+    run,batch=batch_for(db,products);run.purpose='organize';context_for(db,batch,target,classification)
+    rows=suggestions.ingest_suggestions(db,run,batch,{'group_suggestions':[{
+        'name':target['name'],'category_path':'抖音 / 视频','group_id':target['id'],
+        'category_id':classification['id'],'product_ids':[p.id for p in products],'reason':'模型推断不够'}]},auto_apply=True)
+    db.commit()
+    assert rows[0].status=='pending' and '不一致' in rows[0].blocked_reason
+    assert all(p.canonical_id is None for p in products)
+
+
+def test_organize_candidates_are_unique_and_keep_manual_sources_out(db,admin_client):
+    root=category(admin_client,'抖音')
+    general=category(admin_client,'综合互动',parent_id=root['id'])
+    video=category(admin_client,'视频',parent_id=root['id'])
+    broad=group(admin_client,name='抖音点赞',category_id=general['id'],match_mode='similar')
+    specific=group(admin_client,name='抖音视频点赞',category_id=video['id'],match_mode='similar')
+    products=source_products(db,('DY协议秒赞','DY视频赞','DY视频点赞评论套餐','快手视频点赞'))
+    for product in products:product.category_name='综合互动'
+    db.commit()
+    assert [p.id for p in suggestions.organize_candidates(db)]==[products[0].id]
+    assert {p.id for p in suggestions.organize_candidates(db,broad['id'])}=={products[0].id,products[1].id}
+    assert [p.id for p in suggestions.organize_candidates(db,specific['id'])]==[products[1].id]
+    # An administrator's association is excluded even if the source semantics match.
+    assigned=admin_client.put(f"/api/mappings/{broad['id']}",json={
+        'name':broad['name'],'category_id':general['id'],'match_mode':'similar','product_ids':[products[0].id]})
+    assert assigned.status_code==200
+    db.expire_all()
+    assert suggestions.organize_candidates(db)==[]
+
+
+@pytest.mark.parametrize('quantity,quality',[('0',[]),('-1',['unit_requires_review']),('0',['invalid_display_quantity','unit_requires_review'])])
+def test_similar_organize_does_not_relax_invalid_quantity(db,admin_client,quantity,quality):
+    root=category(admin_client,'抖音')
+    classification=category(admin_client,'综合互动',parent_id=root['id'])
+    target=group(admin_client,name='抖音点赞',category_id=classification['id'],match_mode='similar')
+    products=source_products(db,('DY协议秒赞',))
+    product=products[0];product.category_name='协议点赞';product.unit=''
+    product.display_quantity=Decimal(quantity);product.quality=quality;db.commit()
+    assert suggestions.organize_candidates(db,target['id'])==[]
+
+
+def test_organize_duplicate_per_product_and_group_proposals_are_not_applied_twice(db,admin_client):
+    classification=catalogue(admin_client)
+    target=group(admin_client,name='抖音视频点赞',category_id=classification['id'],match_mode='similar')
+    products=source_products(db)
+    run,batch=batch_for(db,products);run.purpose='organize';context_for(db,batch,target,classification)
+    item={'group_id':target['id'],'category_id':classification['id'],'category_path':'抖音 / 视频','reason':'固定建议'}
+    report={'category_suggestions':[{**item,'product_id':p.id,'group_name':'抖音视频点赞'} for p in products],
+            'group_suggestions':[{**item,'name':'抖音视频点赞','product_ids':[p.id for p in products]}]}
+    rows=suggestions.ingest_suggestions(db,run,batch,report,auto_apply=True);db.commit()
+    assert len(rows)==2 and all(row.status=='applied' for row in rows)
+    assert len(report['group_suggestions'])==1
+    assert db.scalar(select(func.count()).select_from(AIApplication))==2
+
+
+def test_undo_earlier_automatic_append_keeps_later_automatic_members(db,admin_client):
+    classification=catalogue(admin_client)
+    target=group(admin_client,name='抖音视频点赞',category_id=classification['id'],match_mode='similar')
+    products=source_products(db)
+    first=propose(db,[products[0]],auto=True)
+    a=db.scalar(select(AIApplication).where(AIApplication.suggestion_id==first.id))
+    second=propose(db,[products[1]],auto=True)
+    b=db.scalar(select(AIApplication).where(AIApplication.suggestion_id==second.id))
+    suggestions.undo_application(db,a.id,1);db.commit()
+    assert products[0].canonical_id is None
+    assert products[1].canonical_id==target['id'] and b.status=='applied'
+    suggestions.undo_application(db,b.id,1);db.commit()
+    assert products[1].canonical_id is None
+
+
+def test_undo_created_group_keeps_other_later_automatic_members(db,admin_client):
+    catalogue(admin_client)
+    products=source_products(db,('抖音视频点赞甲','抖音视频点赞乙','抖音视频点赞丙'))
+    created=propose(db,products[:2],auto=True)
+    app=db.scalar(select(AIApplication).where(AIApplication.suggestion_id==created.id))
+    group_id=created.group_id
+    appended=propose(db,[products[2]],auto=True)
+    assert appended.status=='applied'
+    suggestions.undo_application(db,app.id,1);db.commit()
+    assert products[0].canonical_id is products[1].canonical_id is None
+    assert products[2].canonical_id==group_id and db.get(CanonicalProduct,group_id) is not None

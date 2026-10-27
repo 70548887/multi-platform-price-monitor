@@ -775,3 +775,267 @@ test('old report parameters remain unknown and recorded protocol labels remain f
   assert.equal(state.reasoningLabel('auto'), '自动')
   assert.equal(state.reasoningLabel('xhigh'), 'xhigh')
 })
+
+const organizeSummary = (changes = {}) =>
+  summary({
+    config: {
+      configured: true,
+      daily_product_limit: 1000,
+      daily_request_limit: 20,
+      auto_apply: false,
+      enabled: false,
+    },
+    unorganized_count: 500,
+    organizable_count: 250,
+    ...changes,
+  })
+
+test('organizing only loads target choices until explicit confirmation and never enables daily actions', async () => {
+  const calls = []
+  const { state } = component(
+    'pages/AIAnalysis.vue',
+    async (path, options) => {
+      calls.push({ path, options })
+      if (path === '/ai-analysis/overview') return organizeSummary()
+      if (path.startsWith('/mappings'))
+        return { items: [{ id: 8, name: 'B站视频点赞', match_mode: 'similar' }], total: 1 }
+      if (options?.method === 'POST')
+        return { id: 11, purpose: 'organize', status: 'queued', auto_apply: true }
+      if (path === '/ai-analysis/runs/11')
+        return {
+          id: 11,
+          purpose: 'organize',
+          status: 'queued',
+          organized_count: 0,
+          pending_count: 0,
+        }
+      return { items: [], total: 0 }
+    },
+    { admin: true },
+  )
+  await state.load()
+  assert.equal(state.canOrganize.value, true)
+  await state.openOrganize()
+  assert.equal(state.organizing.value, true)
+  assert.equal(state.organizeForm.limit, 20)
+  assert.equal(
+    calls.some((call) => call.options?.method),
+    false,
+  )
+  state.organizeForm.group_id = '8'
+  await state.submitOrganize()
+  const writes = calls.filter((call) => call.options?.method)
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0].path, '/ai-analysis/organize')
+  assert.deepEqual(JSON.parse(writes[0].options.body), { limit: 20, group_id: 8 })
+  assert.equal(state.overview.value.config.auto_apply, false)
+  assert.equal(state.overview.value.config.enabled, false)
+  assert.equal(state.report.value.id, 11)
+  assert.equal(state.tab.value, 'reports')
+  assert.equal(state.organizing.value, false)
+})
+
+test('organizing is bounded by shared quota and blocked by active tasks or no unorganized products', async () => {
+  const calls = []
+  const { state } = component(
+    'pages/AIAnalysis.vue',
+    async (path, options) => {
+      calls.push({ path, options })
+      return { items: [{ id: 8, name: '已有映射', match_mode: 'similar' }], total: 1 }
+    },
+    { admin: true },
+  )
+  state.loading.value = false
+  state.overview.value = organizeSummary({ today: { products_used: 997, requests_used: 19 } })
+  assert.equal(state.organizeMax.value, 3)
+  await state.openOrganize()
+  assert.equal(state.organizeForm.limit, 3)
+  state.organizeForm.limit = 4
+  await state.submitOrganize()
+  assert.match(state.organizeError.value, /最多可送检 3/)
+  assert.equal(
+    calls.some((call) => call.options?.method),
+    false,
+  )
+  state.overview.value = organizeSummary({ current_run: { id: 9, status: 'running' } })
+  assert.equal(state.canOrganize.value, false)
+  await state.submitOrganize()
+  state.overview.value = organizeSummary({ unorganized_count: 0 })
+  assert.equal(state.canOrganize.value, false)
+  state.overview.value = organizeSummary({ today: { products_used: 0, requests_used: 20 } })
+  assert.equal(state.canOrganize.value, false)
+  assert.equal(
+    calls.some((call) => call.options?.method),
+    false,
+  )
+})
+
+test('missing or failed target choices cannot submit organize tasks', async () => {
+  const calls = []
+  const { state } = component(
+    'pages/AIAnalysis.vue',
+    async (path, options) => {
+      calls.push({ path, options })
+      throw new Error('目标列表暂时不可读取')
+    },
+    { admin: true },
+  )
+  state.loading.value = false
+  state.overview.value = organizeSummary()
+  await state.openOrganize()
+  assert.match(state.organizeError.value, /不可读取/)
+  await state.submitOrganize()
+  assert.equal(
+    calls.some((call) => call.options?.method),
+    false,
+  )
+  state.closeOrganize()
+  assert.equal(state.organizing.value, false)
+})
+
+test('cancelled target loads cannot restore organize dialog or choices later', async () => {
+  let finish
+  const delayed = new Promise((resolve) => (finish = resolve))
+  const { state } = component('pages/AIAnalysis.vue', async () => delayed, { admin: true })
+  state.loading.value = false
+  state.overview.value = organizeSummary()
+  const pending = state.openOrganize()
+  state.closeOrganize()
+  finish({ items: [{ id: 8 }], total: 1 })
+  await pending
+  assert.equal(state.organizing.value, false)
+  assert.equal(state.organizeGroups.value.length, 0)
+})
+
+test('organize target pagination rejects changed totals and never submits a partial selection', async () => {
+  const calls = []
+  const { state } = component(
+    'pages/AIAnalysis.vue',
+    async (path, options) => {
+      calls.push({ path, options })
+      return path.includes('page=1')
+        ? { items: [{ id: 8 }], total: 2 }
+        : { items: [{ id: 9 }], total: 3 }
+    },
+    { admin: true },
+  )
+  state.loading.value = false
+  state.overview.value = organizeSummary()
+  await state.openOrganize()
+  assert.match(state.organizeError.value, /列表已变化/)
+  assert.equal(state.organizeGroups.value.length, 0)
+  await state.submitOrganize()
+  assert.equal(
+    calls.some((call) => call.options?.method),
+    false,
+  )
+  assert.equal(state.purposeLabel({ purpose: 'organize' }), '整理未关联商品')
+  assert.equal(state.purposeLabel({ purpose: 'review' }), '数据分析')
+})
+
+test('organize pending outcome counts distinct unresolved products and preserves zero', () => {
+  const { state } = component('pages/AIAnalysis.vue', async () => ({}), { admin: true })
+  assert.equal(state.pendingProducts({ pending_product_count: 3, pending_count: 5 }), 3)
+  assert.equal(state.pendingProducts({ pending_product_count: 0, pending_count: 5 }), 0)
+  assert.equal(state.pendingProducts({ pending_count: 2 }), 2)
+  assert.equal(state.pendingProducts({}), 0)
+})
+
+test('organize choices only contain similar mappings and exact-only targets cannot submit', async () => {
+  const calls = []
+  let items = [
+    { id: 8, name: '同类点赞', match_mode: 'similar' },
+    { id: 9, name: '同规格点赞', match_mode: 'exact' },
+  ]
+  const { state } = component(
+    'pages/AIAnalysis.vue',
+    async (path, options) => {
+      calls.push({ path, options })
+      return { items, total: items.length }
+    },
+    { admin: true },
+  )
+  state.loading.value = false
+  state.overview.value = organizeSummary()
+  await state.openOrganize()
+  assert.deepEqual(
+    Array.from(state.organizeGroups.value, (item) => item.id),
+    [8],
+  )
+  state.closeOrganize()
+  items = [{ id: 9, name: '同规格点赞', match_mode: 'exact' }]
+  await state.openOrganize()
+  assert.equal(state.organizeGroups.value.length, 0)
+  assert.match(state.organizeError.value, /同类.*相似.*同规格.*人工审核/)
+  await state.submitOrganize()
+  assert.equal(
+    calls.some((call) => call.options?.method),
+    false,
+  )
+})
+
+test('report validation failures retain safe field detail and offer stage-specific help', () => {
+  const { state } = component('pages/AIAnalysis.vue', async () => ({}), { admin: true })
+  state.overview.value = {
+    last_issue: { id: 4, message: '模型报告字段未通过校验', action_hint: '查看批次字段路径' },
+  }
+  state.report.value = {
+    id: 4,
+    status: 'failed',
+    error_code: 'AI_REPORT_SCHEMA_INVALID',
+    message: '模型报告字段不符合约定：category_suggestions.0.group_id',
+  }
+  assert.match(state.reportIssue.value.message, /category_suggestions\.0\.group_id/)
+  assert.match(state.reportIssue.value.action_hint, /字段路径/)
+  state.overview.value = {}
+  state.report.value = {
+    id: 5,
+    status: 'failed',
+    error_code: 'AI_REPORT_JSON_INVALID',
+    message: '模型最终文本不是有效 JSON',
+  }
+  assert.match(state.reportIssue.value.action_hint, /JSON 校验说明/)
+  state.report.value = {
+    id: 6,
+    status: 'failed',
+    error_code: 'AI_REPORT_REFERENCE_INVALID',
+    message: '模型引用了本批次之外的商品编号',
+  }
+  assert.match(state.reportIssue.value.action_hint, /本次送检/)
+})
+
+test('ambiguous general candidates still allow selecting one explicit mapping', async () => {
+  const calls = []
+  const { state } = component(
+    'pages/AIAnalysis.vue',
+    async (path, options) => {
+      calls.push({ path, options })
+      if (path.startsWith('/mappings'))
+        return { items: [{ id: 8, name: '指定点赞', match_mode: 'similar' }], total: 1 }
+      if (path === '/ai-analysis/overview') return organizeSummary({ organizable_count: 0 })
+      if (options?.method) return { id: 99, status: 'queued', purpose: 'organize' }
+      if (path === '/ai-analysis/runs/99') return { id: 99, status: 'queued', purpose: 'organize' }
+      return { items: [], total: 0 }
+    },
+    { admin: true },
+  )
+  state.loading.value = false
+  state.overview.value = organizeSummary({ organizable_count: 0 })
+  assert.equal(state.canOrganize.value, true)
+  await state.openOrganize()
+  assert.equal(state.organizing.value, true)
+  assert.equal(state.organizeForm.limit, 20)
+  assert.equal(state.organizeTargetReady.value, false)
+  await state.submitOrganize()
+  assert.match(state.organizeError.value, /先选择具体映射/)
+  assert.equal(
+    calls.some((call) => call.options?.method),
+    false,
+  )
+  state.organizeForm.group_id = '8'
+  assert.equal(state.organizeTargetReady.value, true)
+  await state.submitOrganize()
+  const posted = calls.filter((call) => call.options?.method)
+  assert.equal(posted.length, 1)
+  assert.deepEqual(JSON.parse(posted[0].options.body), { limit: 20, group_id: 8 })
+})

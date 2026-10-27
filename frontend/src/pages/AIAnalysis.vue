@@ -39,10 +39,16 @@ const confirm = ref<{ action: Action; item?: any } | null>(null),
 const categories = ref<any[]>([]),
   groups = ref<any[]>([]),
   edit = reactive({ category_id: '', group_id: '', group_name: '' })
+const organizing = ref(false),
+  organizeLoading = ref(false),
+  organizeError = ref(''),
+  organizeGroups = ref<any[]>([]),
+  organizeForm = reactive({ limit: 20, group_id: '' })
 let disposed = false,
   request = 0,
   detailRequest = 0,
   editRequest = 0,
+  organizeRequest = 0,
   timer: ReturnType<typeof setTimeout> | undefined
 const labels: Record<string, string> = {
   queued: '排队中',
@@ -111,16 +117,39 @@ const issueHints: Record<string, { message: string; action_hint: string }> = {
     message: 'AI 返回的结构或商品引用未通过校验。',
     action_hint: '商品未因该无效报告被自动整理。请核对模型与 JSON 模式兼容性后再重试。',
   },
+  AI_REPORT_SCHEMA_INVALID: {
+    message: '模型报告字段未通过结构校验，未执行商品整理。',
+    action_hint:
+      '展开失败批次查看具体字段路径与校验阶段；确认接口支持约定的 JSON Schema 后再重试。',
+  },
+  AI_REPORT_JSON_INVALID: {
+    message: '模型最终文本不是有效 JSON，未执行商品整理。',
+    action_hint:
+      '查看失败批次的 JSON 校验说明，核对服务商的结构化输出能力；系统不会把无效文本应用到商品。',
+  },
+  AI_REPORT_REFERENCE_INVALID: {
+    message: '模型引用了不允许的商品编号，未执行商品整理。',
+    action_hint:
+      '仅允许本次送检的商品编号。请展开失败批次检查引用校验说明，不能通过修改关联绕过校验。',
+  },
 }
 const reportIssue = computed(() => {
   const item = report.value
   if (!item || item.preview || !['failed', 'partial'].includes(item.status)) return null
-  return lastIssue.value?.id === item.id
-    ? lastIssue.value
-    : (issueHints[item.error_code] ?? {
-        message: item.message || '分析未完成',
-        action_hint: '请展开批次查看失败原因，核对配置后再手动重试。',
-      })
+  const source =
+    lastIssue.value?.id === item.id
+      ? lastIssue.value
+      : (issueHints[item.error_code] ?? {
+          message: item.message || '分析未完成',
+          action_hint: '请展开批次查看失败原因，核对配置后再手动重试。',
+        })
+  return [
+    'AI_REPORT_SCHEMA_INVALID',
+    'AI_REPORT_JSON_INVALID',
+    'AI_REPORT_REFERENCE_INVALID',
+  ].includes(item.error_code)
+    ? { ...source, message: item.message || source.message }
+    : source
 })
 const hasActiveRun = computed(() =>
   Boolean(currentRun.value && ['queued', 'running'].includes(currentRun.value.status)),
@@ -141,6 +170,25 @@ const canRun = computed(
     !hasActiveRun.value &&
     quotaAvailable.value,
 )
+const unorganizedCount = computed(() => Number(overview.value?.unorganized_count ?? 0))
+const organizableCount = computed(() => Number(overview.value?.organizable_count ?? 0))
+const organizeMax = computed(() =>
+  Math.max(
+    0,
+    Math.min(
+      100,
+      unorganizedCount.value,
+      (cfg.value?.daily_product_limit ?? 1000) - (today.value.products_used ?? 0),
+      ((cfg.value?.daily_request_limit ?? 20) - (today.value.requests_used ?? 0)) * 50,
+    ),
+  ),
+)
+const canOrganize = computed(() => canRun.value && organizeMax.value > 0)
+const organizeTargetReady = computed(
+  () => Boolean(organizeForm.group_id) || organizableCount.value > 0,
+)
+const purposeLabel = (item: any) => (item?.purpose === 'organize' ? '整理未关联商品' : '数据分析')
+const pendingProducts = (item: any) => item?.pending_product_count ?? item?.pending_count ?? 0
 const selectableGroups = computed(() =>
   groups.value.filter(
     (g) => !edit.category_id || String(g.category_id ?? '') === String(edit.category_id),
@@ -247,11 +295,14 @@ function clearVisibleData() {
   report.value = null
   total.value = 0
   editing.value = null
+  organizing.value = false
+  organizeGroups.value = []
   confirm.value = null
   categories.value = []
   groups.value = []
   detailRequest++
   editRequest++
+  organizeRequest++
 }
 async function load() {
   const n = ++request,
@@ -356,6 +407,86 @@ async function mutate(path: string, body: any, success: string, method = 'POST')
 async function run() {
   if (!canRun.value) return
   return mutate('/ai-analysis/run', {}, '分析任务已提交。进度会自动刷新。')
+}
+async function openOrganize() {
+  if (!canOrganize.value) return
+  const sequence = ++organizeRequest
+  organizing.value = true
+  organizeLoading.value = true
+  organizeError.value = ''
+  organizeGroups.value = []
+  organizeForm.limit = Math.min(20, organizeMax.value)
+  organizeForm.group_id = ''
+  try {
+    const result = await api('/mappings?page=1&page_size=100')
+    const all = itemsOf(result),
+      count = result.total ?? all.length
+    const seen = new Set(all.map((item: any) => item.id))
+    for (let nextPage = 2; all.length < count; nextPage++) {
+      if (disposed || sequence !== organizeRequest) return
+      const next = await api(`/mappings?page=${nextPage}&page_size=100`)
+      const chunk = itemsOf(next)
+      if (next.total !== count || !chunk.length || chunk.some((item: any) => seen.has(item.id)))
+        throw new Error('映射商品列表已变化，请重新打开整理窗口。')
+      chunk.forEach((item: any) => seen.add(item.id))
+      all.push(...chunk)
+    }
+    if (!disposed && sequence === organizeRequest) {
+      organizeGroups.value = all.filter((group: any) => group.match_mode === 'similar')
+      if (!organizeGroups.value.length)
+        organizeError.value =
+          '当前没有同类／相似映射商品。请先在全网比价中建立此类映射；同规格商品需人工审核。'
+    }
+  } catch (e: any) {
+    if (!disposed && sequence === organizeRequest) organizeError.value = e.message
+  } finally {
+    if (!disposed && sequence === organizeRequest) organizeLoading.value = false
+  }
+}
+function closeOrganize() {
+  if (busy.value) return
+  organizeRequest++
+  organizing.value = false
+  organizeLoading.value = false
+  organizeError.value = ''
+}
+async function submitOrganize() {
+  if (
+    !organizing.value ||
+    !canOrganize.value ||
+    organizeLoading.value ||
+    !organizeGroups.value.length
+  )
+    return
+  organizeError.value = ''
+  const limit = organizeForm.limit
+  if (!organizeTargetReady.value) {
+    organizeError.value = '当前没有可唯一匹配的通用候选，请先选择具体映射商品以限定整理目标。'
+    return
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > organizeMax.value) {
+    organizeError.value = `本次最多可送检 ${organizeMax.value} 件，请填写有效数量。`
+    return
+  }
+  if (
+    organizeForm.group_id &&
+    !organizeGroups.value.some((item: any) => String(item.id) === organizeForm.group_id)
+  ) {
+    organizeError.value = '请选择当前列表中的映射商品。'
+    return
+  }
+  const result = await mutate(
+    '/ai-analysis/organize',
+    {
+      limit,
+      group_id: organizeForm.group_id ? Number(organizeForm.group_id) : null,
+    },
+    '整理任务已提交。本次只对已有映射处理未关联商品，符合规则后自动关联，其余进入待审核。',
+  )
+  if (result && !disposed) {
+    organizing.value = false
+    if (result.id) await view(result)
+  }
 }
 function ask(action: Action, item?: any) {
   if (!busy.value) confirm.value = { action, item }
@@ -568,6 +699,7 @@ onBeforeUnmount(() => {
   request++
   detailRequest++
   editRequest++
+  organizeRequest++
   clearTimeout(timer)
 })
 </script>
@@ -583,8 +715,15 @@ onBeforeUnmount(() => {
           ><Icon name="settings" :size="15" />AI 配置</RouterLink
         ><button type="button" class="btn btn-white" :disabled="busy" @click="preview">
           <Icon name="shield" :size="15" />程序核对</button
-        ><button type="button" class="btn btn-primary" :disabled="!canRun" @click="ask('run')">
-          <Icon name="play" :size="15" />立即分析
+        ><button type="button" class="btn btn-white" :disabled="!canRun" @click="ask('run')">
+          <Icon name="play" :size="15" />立即分析</button
+        ><button
+          type="button"
+          class="btn btn-primary"
+          :disabled="!canOrganize"
+          @click="openOrganize"
+        >
+          <Icon name="link" :size="15" />整理未关联商品
         </button>
       </div>
     </header>
@@ -615,6 +754,26 @@ onBeforeUnmount(() => {
     </div>
     <template v-else-if="overview">
       <section v-if="tab === 'overview'" aria-label="运行概览">
+        <section class="panel ai-organize-intro" aria-label="未关联商品整理">
+          <div>
+            <h2>将未关联商品归入已有映射</h2>
+            <p>
+              未关联 {{ unorganizedCount.toLocaleString() }} 件，其中当前可送检
+              {{ organizableCount.toLocaleString() }} 件。可送检不代表一定满足自动关联规则。
+            </p>
+            <small
+              >每次小批量处理：只追加未关联商品，保留人工关联和原始报价；不确定的匹配进入待审核。</small
+            >
+          </div>
+          <button
+            type="button"
+            class="btn btn-primary"
+            :disabled="!canOrganize"
+            @click="openOrganize"
+          >
+            <Icon name="link" :size="15" />开始整理
+          </button>
+        </section>
         <div v-if="!cfg?.configured" class="notice info">
           <Icon name="key" :size="18" />
           <div>
@@ -688,7 +847,10 @@ onBeforeUnmount(() => {
             <template v-if="currentRun"
               ><div class="ai-run-heading">
                 <strong>任务 #{{ currentRun.id }} · {{ stage(currentRun) }}</strong
-                ><span>{{ currentRun.trigger === 'daily' ? '每日定时' : '手动分析' }}</span>
+                ><span
+                  >{{ purposeLabel(currentRun) }} ·
+                  {{ currentRun.trigger === 'daily' ? '每日定时' : '手动' }}</span
+                >
               </div>
               <p class="ai-muted">{{ currentRun.message }}</p>
               <progress
@@ -700,6 +862,11 @@ onBeforeUnmount(() => {
                 {{ currentRun.completed_batches ?? 0 }} / {{ currentRun.batch_count ?? 0 }} 批次 ·
                 成功检查 {{ currentRun.checked_count ?? 0 }} /
                 {{ currentRun.planned_count ?? 0 }} 件
+              </p>
+              <p v-if="currentRun.purpose === 'organize'" class="ai-organize-result">
+                已自动关联 {{ currentRun.organized_count ?? 0 }} 件 · 待审核
+                {{ pendingProducts(currentRun) }}
+                件。本次任务允许按规则应用，不更改每日自动分析设置。
               </p>
               <p v-if="currentRun.stop_requested" class="ai-muted">
                 已请求停止；正在执行的请求仍会完成。
@@ -791,7 +958,14 @@ onBeforeUnmount(() => {
             <button v-for="item in runs" :key="item.id" type="button" @click="view(item)">
               <span
                 ><strong
-                  >{{ item.trigger === 'daily' ? '每日分析' : '手动分析' }} #{{ item.id }}</strong
+                  >{{
+                    item.purpose === 'organize'
+                      ? '商品整理'
+                      : item.trigger === 'daily'
+                        ? '每日分析'
+                        : '手动分析'
+                  }}
+                  #{{ item.id }}</strong
                 ><small>{{ date(item.created_at) }}</small></span
               ><span class="badge" :class="badge(item.status)">{{ label(item.status) }}</span
               ><Icon name="arrow" :size="15" />
@@ -936,6 +1110,21 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <p v-else class="ai-muted">{{ report.message }}</p>
+          <div v-if="report.purpose === 'organize'" class="ai-organize-result" role="status">
+            <strong
+              >未关联商品整理 · 已关联 {{ report.organized_count ?? 0 }} 件 · 待审核
+              {{ pendingProducts(report) }} 件</strong
+            >
+            <p>
+              本次任务仅追加到已有映射商品；不改动原始价格、源类目或人工关联。规则无法确认的建议请在“待审核建议”中处理。
+            </p>
+            <button type="button" class="text-link" @click="selectTab('applications')">
+              查看整理记录<Icon name="arrow" :size="14" />
+            </button>
+          </div>
+          <p v-else-if="report.auto_apply && !report.preview" class="ai-small-note">
+            此任务允许按规则自动应用建议，具体结果以处理记录为准。
+          </p>
           <p class="ai-period">
             统计期：{{ date(report.snapshot?.period_start) }} ～
             {{ date(report.snapshot?.period_end)
@@ -1228,7 +1417,7 @@ onBeforeUnmount(() => {
                     <div class="table-secondary">{{ date(item.created_at) }}</div>
                   </td>
                   <td>
-                    {{ item.trigger === 'daily' ? '每日定时' : '手动' }}
+                    {{ purposeLabel(item) }} · {{ item.trigger === 'daily' ? '每日定时' : '手动' }}
                     <div class="table-secondary">{{ item.model }}</div>
                     <div class="table-secondary">
                       {{ protocolLabel(item.api_format) }} ·
@@ -1242,6 +1431,10 @@ onBeforeUnmount(() => {
                   <td>
                     {{ item.checked_count ?? item.sampled_products ?? 0 }} /
                     {{ item.planned_count ?? '—' }}
+                    <div v-if="item.purpose === 'organize'" class="table-secondary">
+                      已关联 {{ item.organized_count ?? 0 }} 件 · 待审核
+                      {{ pendingProducts(item) }} 件
+                    </div>
                   </td>
                   <td class="ai-excerpt">{{ item.summary || item.message }}</td>
                   <td>
@@ -1343,6 +1536,63 @@ onBeforeUnmount(() => {
         /><Pagination v-if="total" :page="page" :total="total" :page-size="20" @change="change" />
       </section>
     </template>
+    <Modal v-if="organizing" title="整理未关联商品" @close="closeOrganize">
+      <p class="ai-dialog-copy">
+        仅检查尚未归属映射商品的有效商品，匹配你已有的映射商品。确认后会发送模型请求并占用今日额度；通过本地规则的结果会自动增量关联，其余进入待审核。本次操作不会开启每日自动分析。
+      </p>
+      <div v-if="organizeLoading" class="loading-state">
+        <span class="spinner"></span>正在读取已有映射商品…
+      </div>
+      <form v-else @submit.prevent="submitOrganize">
+        <label
+          >目标映射商品<select
+            v-model="organizeForm.group_id"
+            :disabled="busy || !organizeGroups.length"
+          >
+            <option value="" :disabled="organizableCount <= 0">所有已有同类／相似映射商品</option>
+            <option v-for="group in organizeGroups" :key="group.id" :value="String(group.id)">
+              {{ group.name }} · {{ group.category_path_name || group.category_name || '未分类' }}
+            </option>
+          </select></label
+        >
+        <label
+          >本次最多送检数量<input
+            v-model.number="organizeForm.limit"
+            type="number"
+            min="1"
+            :max="organizeMax"
+            step="1"
+            required
+            :disabled="busy"
+            aria-describedby="organize-limit-help"
+        /></label>
+        <p v-if="organizableCount <= 0" class="notice info" role="status">
+          暂时没有可唯一匹配的通用候选。请选择具体映射商品以限定目标，系统将重新核对可整理商品。
+        </p>
+        <p id="organize-limit-help" class="ai-small-note">
+          默认至多 20 件，每次最多 100 件；按未关联数量及今日剩余额度，本次上限为
+          {{ organizeMax }} 件。实际送检数量由所选映射及后端规则核对，可能少于此上限。
+        </p>
+        <p class="ai-small-note">
+          此处仅选择已有同类／相似映射，目标不会由此操作创建或改名。同规格商品保留人工处理；业务或场景不明确的匹配进入待审核。未关联不会被当作已整理。
+        </p>
+        <div v-if="organizeError" class="notice error" role="alert">{{ organizeError }}</div>
+        <div v-if="error" class="notice error" role="alert">{{ error }}</div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-white" :disabled="busy" @click="closeOrganize">
+            取消</button
+          ><button
+            type="submit"
+            class="btn btn-primary"
+            :disabled="
+              !canOrganize || !organizeTargetReady || organizeLoading || !organizeGroups.length
+            "
+          >
+            {{ busy ? '提交中…' : '确认整理并按规则关联' }}
+          </button>
+        </div>
+      </form>
+    </Modal>
     <Modal v-if="confirm" :title="confirmation.title" @close="!busy && (confirm = null)"
       ><p class="ai-dialog-copy">{{ confirmation.text }}</p>
       <div v-if="confirm.item?.group_name" class="ai-confirm-target">
@@ -1411,6 +1661,54 @@ onBeforeUnmount(() => {
   </div>
 </template>
 <style scoped>
+.ai-organize-intro {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 22px 24px;
+  border-color: #dbe5ff;
+  background: #f8faff;
+}
+.ai-organize-intro h2 {
+  font-size: 16px;
+  color: #385a9a;
+  margin-bottom: 8px;
+}
+.ai-organize-intro p {
+  font-size: 12px;
+  color: #647b9e;
+  line-height: 1.8;
+}
+.ai-organize-intro small {
+  display: block;
+  margin-top: 5px;
+  font-size: 11px;
+  color: #8292aa;
+  line-height: 1.8;
+}
+.ai-organize-result {
+  padding: 14px 16px;
+  margin: 16px 0;
+  color: #41658b;
+  background: #edf5ff;
+  border: 1px solid #deebfc;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.9;
+}
+.ai-organize-result p {
+  margin: 5px 0 8px;
+  color: #71859e;
+}
+@media (max-width: 680px) {
+  .ai-organize-intro {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 14px;
+    padding: 19px;
+  }
+}
 .ai-last-issue {
   padding: 20px 23px;
   border-color: #f0dfbf;

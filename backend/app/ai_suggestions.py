@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from datetime import timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 import hashlib
 import json
 import re
+from types import SimpleNamespace
 
 from fastapi import HTTPException
 from sqlalchemy import select, text
@@ -25,28 +27,87 @@ BUSINESSES = frozenset(('哔哩哔哩', '抖音', '快手', '小红书', '视频
 ACTIONS = frozenset(('点赞', '播放', '粉丝', '评论', '收藏', '分享'))
 SCENES = frozenset(('视频', '直播'))
 WRITABLE_FIELDS = frozenset(('revision', 'category_id', 'group_id', 'group_name'))
+_SEMANTIC_PATTERNS = tuple((re.compile(alias_pattern(alias)), label)
+    for alias, label in sorted(((alias, label) for label, aliases in ALIASES.items() for alias in aliases),
+                              key=lambda item: len(item[0]), reverse=True))
 
 
 def comparison_lock(db):
     db.execute(text('SELECT pg_advisory_xact_lock(71960209)'))
 
 
-def semantic_signature(value):
-    """Use known lexical evidence only; never trust a model's confidence score."""
+def semantic_components(value):
+    """Business/action/scene evidence, without guessing missing distinctions."""
     value = normalize(value)
+    # Cache source text only, never product eligibility, group state, price or
+    # ownership. Oversized labels are scanned without retaining their bytes.
+    return _cached_semantic_components(value) if len(value) <= 4096 else _scan_semantic_components(value)
+
+
+@lru_cache(maxsize=16384)
+def _cached_semantic_components(value):
+    return _scan_semantic_components(value)
+
+
+def _scan_semantic_components(value):
     spans, labels = [], set()
-    options = sorted(((alias, label) for label, aliases in ALIASES.items()
-                      for alias in aliases), key=lambda item: len(item[0]), reverse=True)
-    for alias, label in options:
-        for match in re.finditer(alias_pattern(alias), value):
+    for pattern, label in _SEMANTIC_PATTERNS:
+        for match in pattern.finditer(value):
             if any(left < match.end() and match.start() < right for left, right in spans):
                 continue
             spans.append(match.span())
             labels.add(label)
-    values = [labels & group for group in (BUSINESSES, ACTIONS, SCENES)]
+    return tuple(frozenset(labels & group) for group in (BUSINESSES, ACTIONS, SCENES))
+
+
+def semantic_signature(value):
+    """Use known lexical evidence only; never trust a model's confidence score."""
+    values = semantic_components(value)
     if any(len(group) != 1 for group in values):
         return None
     return tuple(next(iter(group)) for group in values)
+
+
+def target_signature(tree, group):
+    """Existing explicit general categories can group an unspecified scene."""
+    path = _path(tree, group.category_id)
+    business, actions, scenes = semantic_components(path + ' ' + group.name)
+    if len(business) != 1 or len(actions) != 1 or len(scenes) > 1:
+        return None
+    if len(scenes) == 1:
+        return next(iter(business)), next(iter(actions)), next(iter(scenes))
+    general_names = {'综合互动', '通用', '综合', '通用互动'}
+    if group.match_mode == 'similar' and any(row.name in general_names for row in tree.path(group.category_id)):
+        return next(iter(business)), next(iter(actions)), None
+    return None
+
+
+def matches_target(product, signature):
+    business, actions, scenes = semantic_components(product.name + ' ' + product.category_name)
+    if (signature is None or len(business) != 1 or len(actions) != 1 or len(scenes) > 1
+            or next(iter(business)) != signature[0] or next(iter(actions)) != signature[1]):
+        return False
+    return signature[2] is None or scenes == {signature[2]}
+
+
+def organize_candidates(db, group_id=None):
+    """Read-only candidate selection: existing unique similar target, fresh source."""
+    tree = CategoryTree.load(db)
+    groups = list(db.scalars(select(CanonicalProduct).where(CanonicalProduct.match_mode == 'similar')))
+    if group_id is not None:
+        groups = [group for group in groups if group.id == group_id]
+    targets = [(group, target_signature(tree, group)) for group in groups]
+    platforms = {platform.id: platform for platform in db.scalars(select(Platform))}
+    candidates = []
+    for product in db.scalars(select(Product).where(Product.canonical_id.is_(None), Product.status == 'active').order_by(Product.id)):
+        snapshot = {'fingerprint': _fingerprint(product), 'canonical_id': None,
+                    'mapping_revision': product.mapping_revision or 0}
+        if _is_current(product, snapshot, platforms.get(product.platform_id), utcnow()):
+            continue
+        possible = [group for group, signature in targets if matches_target(product, signature)]
+        if len(possible) == 1:
+            candidates.append(product)
+    return candidates
 
 
 def _fingerprint(product):
@@ -102,7 +163,11 @@ def _is_current(product, snapshot, platform, now):
         return '商品不在售或价格、计价数量无效'
     try:
         price, quantity = Decimal(product.price), Decimal(product.display_quantity)
-        if not price.is_finite() or price < 0 or not quantity.is_finite() or quantity <= 0:
+        # Source quantity zero with an undeclared unit is preserved throughout
+        # collection and price display. It cannot support an exact comparison,
+        # but it is not an invalid price or a reason to forbid similar grouping.
+        unspecified_quantity = quantity == 0 and not product.unit and 'unit_requires_review' in (product.quality or [])
+        if not price.is_finite() or price < 0 or not quantity.is_finite() or quantity < 0 or (quantity == 0 and not unspecified_quantity):
             return '商品价格或计价数量无效'
     except (TypeError, InvalidOperation):
         return '商品价格或计价数量无效'
@@ -148,9 +213,9 @@ def _target_group(db, row, tree, *, automatic):
         if not automatic:
             return pinned, ''
     same_name = [group for group in groups if normalize(group.name) == normalize(row.group_name)]
-    signature = semantic_signature(_path(tree, row.category_id) + ' ' + row.group_name)
+    signature = target_signature(tree, SimpleNamespace(category_id=row.category_id,name=row.group_name,match_mode='similar'))
     same_semantics = [group for group in groups if signature and
-                      semantic_signature(_path(tree, group.category_id) + ' ' + group.name) == signature]
+                      target_signature(tree, group) == signature]
     # Exact spelling must not hide a second valid alias/semantic candidate.
     candidates = list({group.id: group for group in same_name + (same_semantics if automatic else [])}.values())
     if automatic and pinned is not None:
@@ -168,15 +233,15 @@ def _target_group(db, row, tree, *, automatic):
 
 
 def _automatic_reason(db, row, products, group, tree):
-    target_signature = semantic_signature(_path(tree, row.category_id) + ' ' + row.group_name)
-    if target_signature is None:
+    signature = target_signature(tree, group) if group else semantic_signature(_path(tree, row.category_id) + ' ' + row.group_name)
+    if signature is None:
         return '业务平台、服务动作或视频／直播场景不明确，需人工审核'
-    if any(semantic_signature(product.name + ' ' + product.category_name) != target_signature for product in products):
+    if any(not matches_target(product, signature) for product in products):
         return '商品业务、服务动作或场景与目标不一致，需人工审核'
     if group:
         if group.match_mode != 'similar':
             return '同规格统一商品需要人工核对单位、币种和规格'
-        if semantic_signature(_path(tree, group.category_id) + ' ' + group.name) != target_signature:
+        if target_signature(tree, group) != signature:
             return '已有统一商品的业务特征不一致，需人工审核'
     elif len({product.platform_id for product in products}) < 2:
         return '自动新建统一商品至少需要两个不同交易平台的商品'
@@ -201,18 +266,69 @@ def ingest_suggestions(db, run, batch, report, auto_apply=False):
     comparison_lock(db)
     tree = CategoryTree.load(db)
     snapshots = {item['id']: item for item in batch.snapshot.get('products', [])}
-    proposals = [('category', [item['product_id']], item['category_path'], item['group_name'], item['reason'])
+    context_groups = {item['id']: item for item in batch.snapshot.get('existing_comparison_groups', [])
+                      if isinstance(item, dict) and type(item.get('id')) is int}
+    context_categories = {item['id']: item for item in batch.snapshot.get('comparison_categories', [])
+                          if isinstance(item, dict) and type(item.get('id')) is int}
+    proposals = [('category', [item['product_id']], item['category_path'], item['group_name'], item['reason'], item.get('group_id'), item.get('category_id'))
                  for item in report.get('category_suggestions', [])]
-    proposals += [('group', item['product_ids'], item['category_path'], item['name'], item['reason'])
+    proposals += [('group', item['product_ids'], item['category_path'], item['name'], item['reason'], item.get('group_id'), item.get('category_id'))
                   for item in report.get('group_suggestions', [])]
+    if getattr(run,'purpose',None)=='organize':
+        # A model can describe the same assignment individually and in a
+        # group. Keep one proposal per product/target; preserve raw report.
+        coverage=set()
+        filtered=[]
+        for proposal in proposals:
+            kind,ids,path,name,reason,gid,cid=proposal
+            target=(gid,cid,normalize(path),normalize(name))
+            remaining=[identifier for identifier in ids if (identifier,target) not in coverage]
+            if not remaining:
+                continue
+            coverage.update((identifier,target) for identifier in remaining)
+            filtered.append(('category' if len(remaining)==1 else kind,remaining,path,name,reason,gid,cid))
+        proposals=filtered
     result = []
-    for kind, ids, path, name, reason in proposals:
+    for kind, ids, path, name, reason, explicit_group_id, explicit_category_id in proposals:
         # The transport already validates references. Recheck here so direct
         # callers cannot bypass the snapshot boundary or submit duplicate IDs.
         if not ids or len(ids) != len(set(ids)) or any(type(i) is not int or i not in snapshots for i in ids):
             continue
         selected = [dict(snapshots[identifier]) for identifier in sorted(ids)]
         category_id = _resolve_category(tree, path)
+        target_reason = ''
+        explicit_target = None
+        if explicit_category_id is not None:
+            if type(explicit_category_id) is not int or explicit_category_id not in context_categories:
+                target_reason = '建议类目编号不在本次输入目录中，请人工核对'
+            elif explicit_category_id not in tree.by_id:
+                target_reason = '建议类目已不存在，请重新分析'
+            elif category_id is not None and category_id != explicit_category_id:
+                target_reason = '建议的类目编号和路径不一致，请人工核对'
+            else:
+                category_id = explicit_category_id
+        if explicit_group_id is not None:
+            saved_target = context_groups.get(explicit_group_id) if type(explicit_group_id) is int else None
+            if saved_target is None:
+                target_reason = '建议统一商品编号不在本次输入目录中，请人工核对'
+            else:
+                explicit_target = db.get(CanonicalProduct, explicit_group_id)
+                if explicit_target is None:
+                    target_reason = '目标统一商品已不存在，请重新分析'
+                else:
+                    saved_identity = {key: saved_target.get(key) for key in _target_identity(explicit_target)}
+                    if saved_identity != _target_identity(explicit_target):
+                        target_reason = '目标统一商品缺少输入快照或已变化，请人工核对'
+                    elif category_id is not None and category_id != explicit_target.category_id:
+                        target_reason = '统一商品与建议类目不一致，请人工核对'
+                    else:
+                        category_id, name = explicit_target.category_id, explicit_target.name
+                        path = _path(tree, category_id)
+        organizing = getattr(run, 'purpose', None) == 'organize'
+        if organizing and explicit_group_id is None:
+            target_reason = '整理任务仅关联本次输入的已有统一商品，请选择目录中的目标编号'
+        if organizing and (explicit_target is None or target_reason):
+            selected = [{**item, 'target_context_invalid': True} for item in selected]
         key = _dedupe(_path(tree, category_id) if category_id else path, name, selected)
         previous = db.scalar(select(AISuggestion).where(AISuggestion.dedupe_key == key)
                              .order_by(AISuggestion.id.desc()).limit(1))
@@ -220,18 +336,20 @@ def ingest_suggestions(db, run, batch, report, auto_apply=False):
             result.append(previous)
             continue
         row = AISuggestion(run_id=run.id, batch_id=batch.id, kind=kind, status='pending',
-            category_id=category_id, group_id=None, group_name=str(name).strip()[:200],
+            category_id=category_id, group_id=explicit_group_id if explicit_target else None, group_name=str(name).strip()[:200],
             proposed_category_path=str(path)[:500],
-            reason=str(reason)[:1500], blocked_reason='', revision=1,
+            reason=str(reason)[:1500], blocked_reason=target_reason, revision=1,
             products=selected, dedupe_key=key, created_at=utcnow(), updated_at=utcnow())
         db.add(row)
         db.flush()
-        group, target_reason = _target_group(db, row, tree, automatic=True)
+        if explicit_target and not target_reason:
+            row.products = [{**item, 'target_group_snapshot': _target_identity(explicit_target)} for item in selected]
+        group, resolution_reason = _target_group(db, row, tree, automatic=True) if not target_reason else (None, target_reason)
         if group:
             row.group_id = group.id
             row.products = [{**item, 'target_group_snapshot': _target_identity(group)} for item in selected]
-        row.blocked_reason = target_reason
-        if auto_apply:
+        row.blocked_reason = resolution_reason
+        if auto_apply and not target_reason:
             try:
                 with db.begin_nested():
                     apply_suggestion(db, row.id, None, row.revision, automatic=True)
@@ -254,6 +372,11 @@ def apply_suggestion(db, suggestion_id, actor_id, revision, automatic=False):
         return row
     if row.status != 'pending':
         raise HTTPException(409, '此建议已处理，请刷新后重试')
+    if automatic and any(item.get('target_context_invalid') for item in row.products or []):
+        row.blocked_reason = '建议目标未通过本次输入目录校验，需管理员修改并确认'
+        row.updated_at = utcnow()
+        db.flush()
+        return row
     tree = CategoryTree.load(db)
     products = _current_products(db, row.products)
     snapshots = {item['id']: item for item in row.products}
@@ -271,7 +394,7 @@ def apply_suggestion(db, suggestion_id, actor_id, revision, automatic=False):
     if not reason and automatic:
         reason = _automatic_reason(db, row, products, group, tree)
     if not reason and group and group.match_mode == 'exact':
-        if any(not product.unit or product.unit != group.unit or product.currency != group.currency for product in products):
+        if any(not product.unit or product.unit != group.unit or product.currency != group.currency or product.display_quantity <= 0 for product in products):
             reason = '同规格关联的单位和币种必须明确且一致'
         quantities = {product.display_quantity for product in products}
         existing_quantities = set(db.scalars(select(Product.display_quantity).where(Product.canonical_id == group.id)))
@@ -384,13 +507,13 @@ def undo_application(db, application_id, actor_id):
         raise HTTPException(404, 'AI 处理记录不存在')
     if application.status == 'undone':
         return application
-    group = db.scalar(select(CanonicalProduct).where(CanonicalProduct.id == application.group_id).with_for_update())
+    group = db.scalar(select(CanonicalProduct).where(CanonicalProduct.id == application.group_id).with_for_update().execution_options(populate_existing=True))
     after = application.after or {}
     expected_group = after.get('group')
-    if group is None or not expected_group or _group_evidence(db, group) != expected_group:
+    if group is None or not expected_group or _target_identity(group) != {key:expected_group.get(key) for key in _target_identity(group)}:
         raise HTTPException(409, '统一商品随后已被修改，撤销会覆盖新操作，请人工核对')
     product_ids = [item['id'] for item in after.get('products', [])]
-    products = list(db.scalars(select(Product).where(Product.id.in_(product_ids)).order_by(Product.id).with_for_update()))
+    products = list(db.scalars(select(Product).where(Product.id.in_(product_ids)).order_by(Product.id).with_for_update().execution_options(populate_existing=True)))
     expected_products = {item['id']: item for item in after.get('products', [])}
     if len(products) != len(product_ids) or any(_product_evidence(product) != expected_products[product.id] for product in products):
         raise HTTPException(409, '商品关联随后已被修改，撤销会覆盖新操作，请人工核对')
@@ -402,9 +525,7 @@ def undo_application(db, application_id, actor_id):
         product.ai_application_id = before.get('ai_application_id')
         product.mapping_revision = (product.mapping_revision or 0) + 1
     db.flush()
-    if application.before.get('created_group'):
-        if db.scalar(select(Product.id).where(Product.canonical_id == group.id).limit(1)) is not None:
-            raise HTTPException(409, '新建统一商品已有后续成员，不能自动撤销')
+    if application.before.get('created_group') and db.scalar(select(Product.id).where(Product.canonical_id == group.id).limit(1)) is None:
         db.delete(group)
     else:
         group.mapping_revision = (group.mapping_revision or 0) + 1

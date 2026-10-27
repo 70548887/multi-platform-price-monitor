@@ -30,8 +30,9 @@ BEIJING = ZoneInfo('Asia/Shanghai')
 
 
 class AnalysisError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, *, diagnostic=None, usage=None):
         self.code, self.message = code, message
+        self.diagnostic,self.usage=diagnostic or {},usage
         super().__init__(message)
 
 
@@ -49,6 +50,8 @@ class CategorySuggestion(BaseModel):
     category_path: str = Field(max_length=500)
     group_name: str = Field(max_length=200)
     reason: str = Field(max_length=1500)
+    group_id: StrictInt | None = None
+    category_id: StrictInt | None = None
 
 
 class GroupSuggestion(BaseModel):
@@ -57,6 +60,8 @@ class GroupSuggestion(BaseModel):
     category_path: str = Field(max_length=500)
     product_ids: list[StrictInt] = Field(min_length=2, max_length=30)
     reason: str = Field(max_length=1500)
+    group_id: StrictInt | None = None
+    category_id: StrictInt | None = None
 
 
 class AIReport(BaseModel):
@@ -95,6 +100,7 @@ def settings_connection(db, settings):
 
 def run_dict(row, *, detail=False):
     data = {'id': row.id, 'status': row.status, 'trigger': row.trigger, 'model': row.model,'schema_version':row.schema_version,
+            'purpose':row.purpose,'auto_apply':row.auto_apply,'requested_limit':row.requested_limit,'target_group_id':row.target_group_id,
             'api_format':row.api_format,'reasoning_effort':row.reasoning_effort,'max_output_tokens':row.max_output_tokens,
             'message': row.message, 'error_code': row.error_code, 'created_at': iso(row.created_at),
             'started_at': iso(row.started_at), 'completed_at': iso(row.completed_at),
@@ -114,9 +120,9 @@ def recover_abandoned(db):
     return recover(db)
 
 
-def create_analysis(actor_id=None, *, daily=False, now=None, retry_id=None):
+def create_analysis(actor_id=None, *, daily=False, now=None, retry_id=None,purpose='review',limit=None,group_id=None):
     from .ai_jobs import create_run
-    return create_run(actor_id, daily=daily, now=now, retry_id=retry_id)
+    return create_run(actor_id, daily=daily, now=now, retry_id=retry_id,purpose=purpose,limit=limit,group_id=group_id)
 
 
 def build_snapshot(db, settings, run, product_ids=None):
@@ -160,7 +166,9 @@ def build_snapshot(db, settings, run, product_ids=None):
             order = {identifier:index for index,identifier in enumerate(product_ids)}
             products.sort(key=lambda product:order[product.id])
         tree = CategoryTree.load(snapshot)
-        mappings = list(snapshot.scalars(select(CanonicalProduct).order_by(CanonicalProduct.id).limit(200)))
+        mapping_query=select(CanonicalProduct).order_by(CanonicalProduct.id)
+        if getattr(run,'target_group_id',None):mapping_query=mapping_query.where(CanonicalProduct.id==run.target_group_id)
+        mappings = list(snapshot.scalars(mapping_query.limit(200)))
         ranked = select(Observation.product_id,Observation.observed_at,Observation.price,Observation.status,
             Observation.unit,Observation.currency,Observation.display_quantity,
             func.row_number().over(partition_by=Observation.product_id,
@@ -184,8 +192,11 @@ def build_snapshot(db, settings, run, product_ids=None):
             'comparison_categories':[{'id':i,'path': ' / '.join(r.name for r in tree.path(i))}
                                      for i in tree.ordered_ids()][:200],
             'categories_truncated':len(tree.by_id)>200,
+            'purpose':getattr(run,'purpose','review'),
             'existing_comparison_groups':[{'id':g.id,'name':g.name,'match_mode':g.match_mode,
-                'category_path':' / '.join(r.name for r in tree.path(g.category_id))} for g in mappings],
+                'category_id':g.category_id,'unit':g.unit,'currency':g.currency,'description':g.description,
+                'category_path':' / '.join(r.name for r in tree.path(g.category_id)),
+                'member_examples':[{'name':p.name[:150],'source_category':p.category_name,'unit':p.unit,'display_quantity':decimal_text(p.display_quantity)} for p in snapshot.scalars(select(Product).where(Product.canonical_id==g.id).order_by(Product.id).limit(3))]} for g in mappings],
             'products':[{'id':p.id,'platform_id':p.platform_id,'platform_name':next((t.name for t in platforms if t.id==p.platform_id),''),'name':p.name[:200],
                 'fingerprint':__import__('app.ai_selection',fromlist=['product_fingerprint']).product_fingerprint(p),
                 'mapping_revision':p.mapping_revision,'current_group_name':next((g.name for g in mappings if g.id==p.canonical_id),''),
@@ -205,6 +216,13 @@ SYSTEM_PROMPT = '''你是价格监控平台的数据审查助手。输入 JSON �
 category_suggestions([{product_id,category_path,group_name,reason}])，group_suggestions([{name,category_path,product_ids,reason}])。
 没有建议用空数组，所有product_id来自输入products。你只提供建议，自动应用或人工审核由本地程序按规则决定。'''
 
+ORGANIZE_PROMPT = '''本次是整理未关联商品任务。逐一检查products中的商品，优先归入existing_comparison_groups目录里的唯一已有映射。
+对可明确归入已有映射的每件商品返回category_suggestions，group_id和category_id取目录的真实整数ID，group_name和category_path逐字复制目录值，不编造新ID。
+本任务只使用逐商品category_suggestions；group_suggestions必须为[]，避免同一商品重复提议。不存在对应映射时group_id为null并明确待审核，不建立新映射。
+不要把source_id、平台ID或统一商品ID当作product_id，product_id只来自products[].id。不匹配或有歧义时记findings，不能强行归入。
+已有目标是宽范围综合互动时可按业务和动作匹配；目标明确视频或直播时必须有源商品证据，不从目标本身倒推出源场景。
+未声明计价单位或数量的同类报价可以提出相似归总建议，但不能宣称同规格或自动最低价。输出必须严格符合给出的JSONSchema，不加其他字段或解释文本。'''
+
 
 async def fetch_report(connection, data, *, transport=None):
     from .ai_protocols import build_request,parse_response,ProtocolResponseError
@@ -219,8 +237,13 @@ async def fetch_report(connection, data, *, transport=None):
     payload = json.dumps(data,ensure_ascii=False,separators=(',',':'))
     if len(payload.encode('utf-8'))>200000:
         raise AnalysisError('AI_INPUT_TOO_LARGE','分析摘要超过大小限制，请减小商品样本数')
+    schema=AIReport.model_json_schema()
+    if data.get('purpose')=='organize':
+        schema['properties']['group_suggestions']['maxItems']=0
+    prompt=SYSTEM_PROMPT+('\n'+ORGANIZE_PROMPT if data.get('purpose')=='organize' else '')
+    prompt+='\n输出JSONSchema（所有ID均为整数，空列表用[]；不认识的目标ID用null）：\n'+json.dumps(schema,ensure_ascii=False,separators=(',',':'))
     try:
-        path,headers,body=build_request(connection,payload,SYSTEM_PROMPT,AIReport.model_json_schema())
+        path,headers,body=build_request(connection,payload,prompt,schema)
     except ValueError:
         raise AnalysisError('AI_CONFIGURATION_INVALID','接口类型、思考等级或输出限制配置无效') from None
     try:
@@ -249,7 +272,10 @@ async def fetch_report(connection, data, *, transport=None):
                     content.extend(chunk)
                     if len(content)>256*1024:
                         raise AnalysisError('AI_RESPONSE_TOO_LARGE','AI 响应超过大小限制')
-        raw = json.loads(content)
+        try:
+            raw = json.loads(content)
+        except (ValueError,UnicodeError):
+            raise AnalysisError('AI_ENVELOPE_INVALID','服务商返回内容不是有效的协议 JSON，未执行商品整理',diagnostic={'stage':'protocol_json','response_bytes':len(content)}) from None
         text_content,usage=parse_response(connection,raw)
         # Models must not be able to echo transport credentials into reports.
         for secret in (connection.key, connection.proxy):
@@ -258,15 +284,26 @@ async def fetch_report(connection, data, *, transport=None):
         text_content = text_content.strip()
         if text_content.startswith('```json') and text_content.endswith('```'):
             text_content = text_content[7:-3].strip()
-        report = AIReport.model_validate(json.loads(text_content))
+        try:
+            document=json.loads(text_content)
+        except ValueError:
+            raise AnalysisError('AI_REPORT_JSON_INVALID','模型最终文本不是有效 JSON，未执行商品整理',diagnostic={'stage':'report_json','text_length':len(text_content)},usage=usage) from None
+        try:
+            report = AIReport.model_validate(document)
+        except ValidationError as exc:
+            allowed_names={'summary','findings','category_suggestions','group_suggestions','severity','title','evidence','product_ids','product_id','category_path','group_name','reason','name','group_id','category_id'}
+            fields=[{'path':'.'.join(str(part) if isinstance(part,int) or part in allowed_names else '[field]' for part in error['loc']),
+                     'type':error['type']} for error in exc.errors(include_input=False,include_context=False)[:8]]
+            paths=', '.join(item['path'] for item in fields[:3])
+            raise AnalysisError('AI_REPORT_SCHEMA_INVALID','模型报告字段不符合约定'+('：'+paths if paths else ''),diagnostic={'stage':'report_schema','fields':fields},usage=usage) from None
         allowed = {p['id'] for p in data['products']}
         referenced = {i for finding in report.findings for i in finding.product_ids}
         referenced |= {item.product_id for item in report.category_suggestions}
         referenced |= {i for item in report.group_suggestions for i in item.product_ids}
         if not referenced <= allowed:
-            raise ValueError
+            raise AnalysisError('AI_REPORT_REFERENCE_INVALID','模型引用了本批次之外的商品编号，未执行商品整理',diagnostic={'stage':'references','unknown_count':len(referenced-allowed)},usage=usage)
         if any(len(item.product_ids) != len(set(item.product_ids)) for item in report.group_suggestions):
-            raise ValueError
+            raise AnalysisError('AI_REPORT_REFERENCE_INVALID','模型重复引用同一商品编号，未执行商品整理',diagnostic={'stage':'references','duplicate_ids':True},usage=usage)
         result = report.model_dump()
         if usage is not None:
             result['_usage']=usage

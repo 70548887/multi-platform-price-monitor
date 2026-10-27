@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from .db import SessionLocal
 from .models import (AISettings, AIAnalysisRun, AIAnalysisBatch, AIDailyQuota, AIProductCheck,
-                     AuditLog, Product, utcnow)
+                     AISuggestion,AIApplication,CanonicalProduct,AuditLog, Product, utcnow)
 from .ai_selection import select_products
 from .services import iso
 
@@ -55,7 +55,7 @@ def recover_abandoned(db):
                        else '任务中断；已保存的报告继续保留，未发送批次需手动重试')
 
 
-def create_run(actor_id=None, *, daily=False, now=None, retry_id=None):
+def create_run(actor_id=None, *, daily=False, now=None, retry_id=None,purpose='review',limit=None,group_id=None):
     from . import ai_analysis as service
     import uuid
     now = now or utcnow()
@@ -86,11 +86,25 @@ def create_run(actor_id=None, *, daily=False, now=None, retry_id=None):
                 raise HTTPException(409,'仅可重试失败、部分完成或已停止的任务')
             if previous.schema_version!=2:
                 raise HTTPException(409,'旧版报告保留只读，请创建新的分析任务')
+            purpose,limit,group_id=previous.purpose,previous.requested_limit,previous.target_group_id
+        if purpose not in ('review','organize'):
+            raise HTTPException(422,'分析目的无效')
+        if purpose=='organize':
+            from .ai_suggestions import organize_candidates
+            limit=20 if limit is None else limit
+            if type(limit) is not int or not 1<=limit<=100:
+                raise HTTPException(422,'单次整理数量须为1到100件')
+            if group_id is not None and not db.get(CanonicalProduct,group_id):
+                raise HTTPException(404,'目标映射商品不存在')
+            if not organize_candidates(db,group_id=group_id):
+                raise HTTPException(409,'目前没有符合已建映射规则的未关联商品；请先建立对应映射或核对采集状态')
         run = AIAnalysisRun(schema_version=2,
             dedupe_key='daily:'+day if daily else 'manual:'+uuid.uuid4().hex,
             trigger='daily' if daily else 'manual', actor_id=actor_id, model=settings.model,
             api_format=settings.api_format,reasoning_effort=settings.reasoning_effort,max_output_tokens=settings.max_output_tokens,
             settings_revision=settings.revision, status='queued', stage='queued',
+            purpose=purpose,requested_limit=limit,target_group_id=group_id,
+            auto_apply=purpose=='organize' or settings.auto_apply,
             message='等待独立 AI 工作进程执行', created_at=now, parent_run_id=retry_id)
         db.add(run);db.flush()
         db.add(AuditLog(user_id=actor_id,action='queue_ai_analysis',target=str(run.id)))
@@ -102,7 +116,7 @@ def batch_dict(batch, detail=False):
     result = {'id':batch.id,'ordinal':batch.ordinal,'status':batch.status,
               'product_count':len(batch.product_ids),'checked_count':len(batch.product_ids) if batch.status=='succeeded' else 0,
               'usage':batch.usage,'message':batch.message,'error_code':batch.error_code,
-              'started_at':iso(batch.started_at),'completed_at':iso(batch.completed_at)}
+              'started_at':iso(batch.started_at),'completed_at':iso(batch.completed_at),'diagnostic':batch.diagnostic}
     if detail:
         result.update(snapshot=batch.snapshot,report=batch.report)
     return result
@@ -127,6 +141,12 @@ def run_progress(db, run, detail=False):
               'stop_requested':run.stop_requested,'usage':usage,
               'usage_partial':len(known)<sum(b.started_at is not None for b in batches)
                               or any(any(key not in u for u in known) for key in fields)}
+    suggestions=list(db.scalars(select(AISuggestion).where(AISuggestion.run_id==run.id)))
+    applications=list(db.scalars(select(AIApplication).where(AIApplication.suggestion_id.in_([s.id for s in suggestions]),AIApplication.status=='applied')))
+    applied_ids={p['id'] for item in applications for p in item.products}
+    result['organized_count']=len(applied_ids)
+    result['pending_count']=sum(s.status in ('pending','stale') for s in suggestions)
+    result['pending_product_count']=len({p['id'] for s in suggestions if s.status in ('pending','stale') for p in s.products}-applied_ids)
     if detail:
         result['batches'] = [batch_dict(b,True) for b in batches]
     return result
@@ -201,7 +221,9 @@ async def execute_run(run_id):
                         AIProductCheck.last_checked_at>=original.created_at)))
                     retry_ids=[i for b in original_batches if b.status!='succeeded'
                                for i in b.product_ids if i not in completed_elsewhere]
-            ids=select_products(db,min(remaining,requests*50),end-timedelta(days=1),end,retry_ids)
+            capacity=min(remaining,requests*50,run.requested_limit or remaining)
+            ids=select_products(db,capacity,end-timedelta(days=1),end,retry_ids,
+                                purpose=run.purpose,group_id=run.target_group_id)
             data=service.build_snapshot(db,settings,run,ids)
             # Frozen inputs are kept per batch; historical facts and current states have separate timestamps.
             run.snapshot={**data,'products':[]}
@@ -274,6 +296,8 @@ async def execute_run(run_id):
                 batch.status='failed'
                 batch.error_code=failure.code if isinstance(failure,service.AnalysisError) else 'AI_REQUEST_FAILED'
                 batch.message=failure.message if isinstance(failure,service.AnalysisError) else '请求失败或超时，未自动重试'
+                batch.diagnostic=failure.diagnostic if isinstance(failure,service.AnalysisError) else {}
+                batch.usage=failure.usage if isinstance(failure,service.AnalysisError) else None
                 run.error_code=batch.error_code
                 for pending in db.scalars(select(AIAnalysisBatch).where(AIAnalysisBatch.run_id==run.id,
                     AIAnalysisBatch.status=='queued')):
@@ -294,7 +318,7 @@ async def execute_run(run_id):
                 if run.status!='running' or batch.status!='reviewing':
                     db.commit();return {'run_id':run_id,'status':run.status}
                 settings=db.get(AISettings,1)
-                automatic=bool(settings and settings.auto_apply and settings.revision==run.settings_revision
+                automatic=bool(settings and run.auto_apply and (run.purpose=='organize' or settings.auto_apply) and settings.revision==run.settings_revision
                                and not run.stop_requested and not maintenance_active())
                 try:
                     complete_review(db,run,batch,automatic=automatic)

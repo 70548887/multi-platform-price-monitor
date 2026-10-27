@@ -39,15 +39,22 @@ def fair_take(products, amount):
     return selected
 
 
-def select_products(db, limit, start, end, retry_ids=None):
-    rows = list(db.scalars(select(Product).join(Platform).where(Platform.enabled.is_(True))))
+def select_products(db, limit, start, end, retry_ids=None,*,purpose='review',group_id=None):
+    if purpose=='organize':
+        from .ai_suggestions import organize_candidates
+        rows=organize_candidates(db,group_id=group_id)
+    else:
+        rows = list(db.scalars(select(Product).join(Platform).where(Platform.enabled.is_(True))))
     if retry_ids is not None:
         allowed = set(retry_ids)
         rows = [p for p in rows if p.id in allowed]
     else:
         from .ai_jobs import day_key
-        sent = {i for batch in db.scalars(select(AIAnalysisBatch).where(
-            AIAnalysisBatch.request_day == day_key(utcnow()))) for i in batch.product_ids}
+        sent_query=select(AIAnalysisBatch).where(AIAnalysisBatch.request_day == day_key(utcnow()))
+        if purpose=='organize':
+            from .models import AIAnalysisRun
+            sent_query=sent_query.join(AIAnalysisRun).where(AIAnalysisRun.purpose=='organize')
+        sent = {i for batch in db.scalars(sent_query) for i in batch.product_ids}
         rows = [p for p in rows if p.id not in sent]
     checked = {row.product_id: row for row in db.scalars(select(AIProductCheck))}
     minimum = datetime.min.replace(tzinfo=timezone.utc)
