@@ -4,6 +4,7 @@ import { api, ApiError, appVersion, auth, date, itemsOf, json, loadVersion } fro
 import Icon from '../components/Icon.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Modal from '../components/Modal.vue'
+import Pagination from '../components/Pagination.vue'
 
 interface UpdateRun {
   id: number
@@ -50,6 +51,10 @@ interface UpdateConfig {
   auto_restart: boolean
   token_configured?: boolean
   proxy_configured?: boolean
+  proxy_route?: 'direct' | 'overseas' | 'custom'
+  proxy_enabled?: boolean
+  proxy_ready?: boolean
+  proxy_source?: string
 }
 interface UpdateStatus {
   current_version: string
@@ -64,6 +69,9 @@ interface UpdateStatus {
 const config = ref<UpdateConfig | null>(null)
 const status = ref<UpdateStatus | null>(null)
 const history = ref<UpdateRun[]>([])
+const historyPage = ref(1)
+const historyTotal = ref(0)
+const historyPageSize = 20
 const loading = ref(true)
 const refreshing = ref(false)
 const actionBusy = ref('')
@@ -176,7 +184,7 @@ async function refresh(initial = false, forceHistory = false) {
     error.value = ''
     const key = `${run.value?.id ?? ''}:${run.value?.status ?? ''}`
     const requests: Promise<unknown>[] = []
-    if (initial || !config.value)
+    if (initial || forceHistory || !config.value)
       requests.push(
         api<UpdateConfig>('/update/config', { signal: requestController.signal }).then((value) => {
           if (!disposed) config.value = value
@@ -184,9 +192,12 @@ async function refresh(initial = false, forceHistory = false) {
       )
     if (initial || forceHistory || key !== historyKey)
       requests.push(
-        api('/update/history', { signal: requestController.signal }).then((value) => {
+        api(`/update/history?page=${historyPage.value}&page_size=${historyPageSize}`, {
+          signal: requestController.signal,
+        }).then((value) => {
           if (!disposed) {
             history.value = itemsOf<UpdateRun>(value)
+            historyTotal.value = value.total ?? history.value.length
             historyKey = key
           }
         }),
@@ -206,6 +217,11 @@ async function refresh(initial = false, forceHistory = false) {
     }
   }
 }
+async function changeHistoryPage(page: number) {
+  if (disposed || refreshing.value || page === historyPage.value) return
+  historyPage.value = page
+  await refresh(false, true)
+}
 async function perform(
   action: 'check' | 'download' | 'apply' | 'rollback',
   item?: UpdateRun | Backup,
@@ -220,6 +236,7 @@ async function perform(
       action === 'rollback' && item ? { backup_id: item.id } : item ? { run_id: item.id } : {}
     await api(`/update/${action}`, { ...json('POST', body), signal: mutationController.signal })
     if (disposed) return
+    historyPage.value = 1
     confirmAction.value = null
     notice.value = {
       check: '更新检查已提交。',
@@ -338,6 +355,25 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
+      <div v-if="config" class="notice update-network" :class="config.proxy_ready === false ? 'warning' : ''">
+        <strong
+          >更新网络：{{
+            config.proxy_source || (config.proxy_configured ? '独立更新代理' : '直连')
+          }}</strong
+        >
+        <span v-if="config.proxy_route === 'overseas'">
+          · {{ config.proxy_ready ? '已配置并启用' : '未就绪，请配置并启用境外代理' }}
+        </span>
+        <p>
+          GitHub 版本检测、SHA256 校验文件和发布包下载使用此线路；连接失败时不会自动切换为直连。
+        </p>
+        <RouterLink
+          v-if="config.proxy_route === 'overseas'"
+          to="/admin/settings/network"
+          class="text-link"
+          >管理境外代理</RouterLink
+        >
+      </div>
       <section v-if="status && !hostConnected" class="setup-guide update-host">
         <Icon name="platforms" :size="22" />
         <div>
@@ -513,6 +549,13 @@ onBeforeUnmount(() => {
           title="暂无升级记录"
           description="检查和安装更新后，可在这里查看执行结果。"
         />
+        <Pagination
+          v-if="historyTotal"
+          :page="historyPage"
+          :total="historyTotal"
+          :page-size="historyPageSize"
+          @change="changeHistoryPage"
+        />
       </section>
     </template>
     <Modal
@@ -590,6 +633,13 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.update-network {
+  display: block;
+  line-height: 1.8;
+}
+.update-network p {
+  margin: 8px 0;
+}
 .update-page {
   display: grid;
   gap: 20px;

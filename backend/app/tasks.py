@@ -21,6 +21,7 @@ from .services import add_event, persist_page
 from .limits import PlatformLease
 from .platform_registry import adapter_supported
 from .network_settings import get_platform_proxy
+from .ai_worker import AIWorkerHeartbeat
 
 celery_app = Celery('price_monitor', broker=config.REDIS_URL, backend=config.REDIS_URL)
 celery_app.conf.update(
@@ -29,21 +30,36 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True, worker_prefetch_multiplier=1,
     broker_transport_options={'visibility_timeout': 7200, 'global_keyprefix': 'price_monitor:'},
     result_expires=86400,
+    task_routes={'app.tasks.analyze_ai_data': {'queue': 'ai'}},
     beat_schedule={'dispatch-due': {'task': 'app.tasks.dispatch_due', 'schedule': 60.0},
                    'retention': {'task': 'app.tasks.retain_history', 'schedule': 86400.0},
-                   'update-check': {'task': 'app.tasks.check_updates', 'schedule': 60.0}},
+                   'update-check': {'task': 'app.tasks.check_updates', 'schedule': 60.0},
+                   'ai-analysis-check': {'task': 'app.tasks.check_ai_analysis', 'schedule': 60.0}},
 )
+celery_app.steps['worker'].add(AIWorkerHeartbeat)
 
 
 def redis_client():
     return redis.Redis.from_url(config.REDIS_URL, decode_responses=True, socket_timeout=5)
 
 
-def queue_run(db, platform, scheduled_at=None):
+def queue_run(db, platform, scheduled_at=None, *, due_at=None):
+    # Every planning entry point takes the same lock before reading either the
+    # platform schedule or its pending runs. A scheduler candidate may have
+    # become stale while a manual collection held this transaction lock.
+    db.execute(text('SELECT pg_advisory_xact_lock(:key)'), {'key': 800000+platform.id})
+    db.refresh(platform, with_for_update=True)
+    if due_at is not None:
+        if (not platform.enabled or platform.auth_status != 'connected' or not adapter_supported(platform)
+                or not platform.active_rule_id or platform.next_due_at > due_at):
+            return None
+        scheduled_at = platform.next_due_at
     if not adapter_supported(platform):
         raise ValueError('平台采集版本尚待验证')
     if not platform.active_rule_id:
         raise ValueError('平台尚未发布采集规则')
+    if platform.auth_status != 'connected':
+        raise ValueError('请先连接采集账号')
     existing = db.scalar(select(CollectionRun).where(CollectionRun.platform_id == platform.id,
         CollectionRun.status.in_(['queued', 'running'])).order_by(CollectionRun.id.desc()))
     if existing:
@@ -92,7 +108,8 @@ def dispatch_due():
         for platform in db.scalars(select(Platform).where(Platform.enabled.is_(True), Platform.auth_status == 'connected', Platform.active_rule_id.is_not(None), Platform.next_due_at <= now)):
             if not adapter_supported(platform):
                 continue
-            queue_run(db, platform, platform.next_due_at)
+            if queue_run(db, platform, due_at=now) is None:
+                continue
             while platform.next_due_at <= now:
                 platform.next_due_at += timedelta(seconds=platform.interval_seconds)
         db.commit()
@@ -228,6 +245,18 @@ def collect_platform(run_id):
 def check_updates():
     from .update_service import automatic_check
     return automatic_check()
+
+
+@celery_app.task(name='app.tasks.analyze_ai_data', acks_late=True)
+def analyze_ai_data(run_id):
+    from .ai_analysis import execute_analysis
+    return asyncio.run(execute_analysis(run_id))
+
+
+@celery_app.task(name='app.tasks.check_ai_analysis')
+def check_ai_analysis():
+    from .ai_analysis import scheduled_analysis
+    return scheduled_analysis()
 
 
 @celery_app.task(name='app.tasks.retain_history')

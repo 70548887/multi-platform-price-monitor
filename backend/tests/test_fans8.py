@@ -22,6 +22,34 @@ def source(handler, **kwargs):
 
 
 @pytest.mark.asyncio
+async def test_live_catalogue_class_names_survive_without_category_identifiers():
+    async def handler(request):
+        if request.url.path.endswith('goodsClassList'):
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json={'error': 0, 'count': 1, 'info': [{
+            'Id': 2377, 'GoodsName': 'source fixture', 'GoodsPrice': '0.007447',
+            'GoodsStock': -1, 'ClassName1': '小红书', 'ClassName2': '收藏', 'ClassName3': '',
+        }]})
+    async with source(handler, rule={'site_admin_id': 1}) as collector:
+        pages = [page async for page in collector.iter_pages()]
+        product = pages[0][0]
+        assert product.category_name == '小红书 / 收藏'
+        assert product.category_id == ''  # No identifier was supplied; do not invent one.
+        assert product.raw['ClassName1'] == '小红书'
+        assert product.price == Decimal('0.007447')
+
+
+@pytest.mark.parametrize('fields, expected', [
+    ({'ClassName1': '一级', 'ClassName2': ' 二级 ', 'ClassName3': '三级'}, '一级 / 二级 / 三级'),
+    ({'ClassName1': '一级', 'ClassName2': None, 'ClassName3': ''}, '一级'),
+    ({'ClassName1': None, 'ClassName2': 5, 'ClassName3': []}, ''),
+])
+def test_source_category_label_preserves_only_supplied_category_names(fields, expected):
+    from app.collectors.fans8 import source_category_label
+    assert source_category_label(fields) == expected
+
+
+@pytest.mark.asyncio
 async def test_observed_get_contract_bearer_decimals_categories_and_site_identity():
     requests = []
 

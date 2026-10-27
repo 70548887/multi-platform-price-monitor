@@ -2,8 +2,8 @@
 
 The API places HMAC-authenticated jobs in a local spool. This daemon accepts
 only that protocol, not shell commands, arbitrary download URLs or paths.
-All application changes happen after draining collection and stopping only
-the four application services. PostgreSQL, Redis and user data stay in place.
+All application changes happen after draining collection/AI work and stopping
+the application services declared by that version. PostgreSQL, Redis and user data stay in place.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from typing import Callable
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 import uuid
+import yaml
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -37,6 +39,7 @@ from package_release import managed_path, collect_files, version_from_source  # 
 
 
 APP_SERVICES = ("api", "worker", "beat", "web")
+AI_APP_SERVICES = (*APP_SERVICES, 'ai-worker')
 TERMINAL_STATES = {"succeeded", "rolled_back", "failed", "applied"}
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -144,6 +147,73 @@ def process_lock(path: Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+class _WindowsCommandJob:
+    """A private kernel-owned process tree; no PID enumeration or taskkill."""
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [('process_time', ctypes.c_longlong), ('job_time', ctypes.c_longlong),
+                        ('flags', wintypes.DWORD), ('minimum_working_set', ctypes.c_size_t),
+                        ('maximum_working_set', ctypes.c_size_t), ('active_processes', wintypes.DWORD),
+                        ('affinity', ctypes.c_size_t), ('priority', wintypes.DWORD),
+                        ('scheduling', wintypes.DWORD)]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in
+                        ('read_operations', 'write_operations', 'other_operations',
+                         'read_bytes', 'write_bytes', 'other_bytes')]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [('basic', BasicLimits), ('io', IoCounters),
+                        ('process_memory', ctypes.c_size_t), ('job_memory', ctypes.c_size_t),
+                        ('peak_process_memory', ctypes.c_size_t), ('peak_job_memory', ctypes.c_size_t)]
+
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel.SetInformationJobObject.restype = wintypes.BOOL
+        kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel.TerminateJobObject.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        self.kernel = kernel
+        self.handle = kernel.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise OSError(ctypes.get_last_error(), 'Could not create command job')
+        limits = ExtendedLimits()
+        limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, without breakaway.
+        self.limits = limits
+        if not kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            self.close()
+            raise OSError(ctypes.get_last_error(), 'Could not protect command job')
+
+    def assign(self, process):
+        if not self.kernel.AssignProcessToJobObject(self.handle, int(process._handle)):
+            raise OSError('Could not assign the command to its job')
+
+    def terminate(self):
+        if not self.kernel.TerminateJobObject(self.handle, 1):
+            raise OSError('Could not terminate command job')
+
+    def release(self):
+        # A successful native restart intentionally launches long-lived API,
+        # Worker, Beat and web children. Keep them running after the command.
+        import ctypes
+        self.limits.basic.flags = 0
+        if not self.kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(self.limits), ctypes.sizeof(self.limits)):
+            raise OSError('Could not release the completed command job')
+
+    def close(self):
+        if self.handle:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
+
+
 class CommandRunner:
     """Subprocess output is private in memory and never enters public results."""
     def __init__(self, heartbeat: Callable[[], None]):
@@ -153,24 +223,67 @@ class CommandRunner:
         env = os.environ.copy()
         env.update(read_env(cwd / ".env"))
         # The host's own executable must remain independent of the application venv.
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        job = None
+        process = None
+        command, process_options, initial_input = arguments, {}, None
         try:
-            process = subprocess.Popen(arguments, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                                       stderr=subprocess.DEVNULL, creationflags=flags)
+            if os.name == 'nt':
+                job = _WindowsCommandJob()
+                # The isolated interpreter waits on stdin until it belongs to
+                # the job. Only then may it launch the actual command, so even
+                # fast-spawning npm/pip descendants cannot escape containment.
+                gate = 'import json,subprocess,sys; args=json.loads(sys.stdin.buffer.read()); raise SystemExit(subprocess.call(args,stdin=subprocess.DEVNULL))'
+                command = [getattr(sys, '_base_executable', sys.executable), '-I', '-S', '-c', gate]
+                process_options = {'creationflags': subprocess.CREATE_NO_WINDOW, 'stdin': subprocess.PIPE}
+                initial_input = json.dumps(arguments).encode('utf-8')
+            else:
+                process_options = {'start_new_session': True}
+            process = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, **process_options)
+            if job:
+                job.assign(process)
         except OSError as exc:
+            if process:
+                process.kill()
+                process.wait(timeout=2)
+            if job:
+                job.close()
             raise UpdateError("COMMAND_UNAVAILABLE", "所需的宿主机运行工具不可用") from exc
         started = time.monotonic()
         # communicate drains the pipe, avoiding a deadlock on package-manager output.
-        while True:
-            try:
-                output, _ = process.communicate(timeout=4)
-                break
-            except subprocess.TimeoutExpired:
-                self.heartbeat()
-                if time.monotonic() - started > timeout:
-                    process.kill()
-                    process.communicate()
-                    raise UpdateError("COMMAND_TIMEOUT", "宿主机步骤执行超时")
+        try:
+            while True:
+                try:
+                    remaining = max(0.01, timeout - (time.monotonic() - started))
+                    output, _ = process.communicate(input=initial_input, timeout=min(4, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    initial_input = None
+                    self.heartbeat()
+                    if time.monotonic() - started >= timeout:
+                        if job:
+                            job.terminate()
+                        else:
+                            # The leader has not been reaped while communicate
+                            # is waiting, so this group still belongs to us.
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        try:
+                            process.communicate(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            # Cleanup must remain bounded even if a descendant
+                            # deliberately detached from its Unix session.
+                            pass
+                        raise UpdateError("COMMAND_TIMEOUT", "宿主机步骤执行超时")
+        finally:
+            if job:
+                try:
+                    if process.returncode == 0:
+                        job.release()
+                finally:
+                    job.close()
         self.heartbeat()
         if process.returncode:
             raise UpdateError("COMMAND_FAILED", "宿主机步骤执行失败，请检查本机运行环境")
@@ -318,19 +431,47 @@ class HostUpdater:
             except Exception:
                 pass
             self.sleep(2)
-        raise UpdateError("COLLECTION_DRAIN_TIMEOUT", "现有采集未在维护时间内结束，升级尚未应用")
+        raise UpdateError("COLLECTION_DRAIN_TIMEOUT", "现有采集或 AI 请求未在维护时间内结束，升级尚未应用")
+
+    def _app_services(self, directory: Path | None = None) -> tuple[str, ...]:
+        """Old releases/backups have four services; newer ones include AI.
+
+        Discover from the version being prepared or activated, rather than
+        requiring an AI service from a pre-feature rollback target.
+        """
+        directory = directory or self.root
+        if self.mode == 'native':
+            path = directory / 'scripts/native.ps1'
+            source = path.read_text(encoding='utf-8') if path.is_file() else ''
+            has_ai = "Start-Owned 'ai-worker'" in source
+        else:
+            path = directory / 'docker-compose.yml'
+            if not path.is_file():
+                return APP_SERVICES
+            try:
+                document = yaml.safe_load(path.read_text(encoding='utf-8'))
+                if not isinstance(document, dict) or not isinstance(document.get('services'), dict):
+                    raise ValueError
+                has_ai = 'ai-worker' in document['services']
+            except (ValueError, yaml.YAMLError):
+                raise UpdateError('INVALID_COMPOSE_SERVICES', '部署文件中的应用服务定义无效') from None
+        return AI_APP_SERVICES if has_ai else APP_SERVICES
 
     def _healthy(self, job: dict, version: str) -> bool:
         try:
             health = self.probe("health", job["run_id"])
+            required = ('worker', 'beat', 'database', 'redis')
+            if 'ai-worker' in self._app_services():
+                required += ('ai_worker',)
             return (health.get("status") == "ok" and health.get("version") == version
-                    and all(health.get(key) is True for key in ("worker", "beat", "database", "redis"))
+                    and all(health.get(key) is True for key in required)
                     and self._services_healthy())
         except Exception:
             return False
 
     def _services_healthy(self) -> bool:
         """Check actual managed processes/containers, not a stale Redis timestamp."""
+        services = self._app_services()
         if self.mode == "native":
             path = str(self.root / 'scripts/native.ps1').replace("'", "''")
             command = f"$ErrorActionPreference='Stop'; $WarningPreference='SilentlyContinue'; & '{path}' -Action status | ConvertTo-Json -Compress"
@@ -342,8 +483,8 @@ class HostUpdater:
             by_service = {row.get('service'): row for row in rows if isinstance(row, dict)}
             return all(by_service.get(name, {}).get('running') is True
                        and type(by_service[name].get('pid')) is int and by_service[name]['pid'] > 0
-                       for name in APP_SERVICES)
-        output = self.runner(self._compose(self.root) + ["ps", "--all", "--format", "json", *APP_SERVICES],
+                       for name in services)
+        output = self.runner(self._compose(self.root) + ["ps", "--all", "--format", "json", *services],
                              cwd=self.root, timeout=30)
         try:
             rows = json.loads(output)
@@ -351,9 +492,9 @@ class HostUpdater:
                 rows = [rows]
         except json.JSONDecodeError:
             rows = [json.loads(line) for line in output.splitlines() if line.strip()]
-        if not isinstance(rows, list) or len(rows) != len(APP_SERVICES):
+        if not isinstance(rows, list) or len(rows) != len(services):
             return False
-        return {row.get('Service') for row in rows if isinstance(row, dict)} == set(APP_SERVICES) and all(
+        return {row.get('Service') for row in rows if isinstance(row, dict)} == set(services) and all(
             isinstance(row, dict) and row.get('State') == 'running' and row.get('Health') == 'healthy'
             for row in rows)
 
@@ -388,7 +529,7 @@ class HostUpdater:
         return command
 
     def _image_override(self, run_id: int, images: dict[str, str], suffix: str) -> Path:
-        if set(images) != set(APP_SERVICES) or not all(re.fullmatch(r"[a-z0-9][a-z0-9_.:/@-]{0,199}", value) for value in images.values()):
+        if set(images) not in (set(APP_SERVICES), set(AI_APP_SERVICES)) or not all(re.fullmatch(r"[a-z0-9][a-z0-9_.:/@-]{0,199}", value) for value in images.values()):
             raise UpdateError("INVALID_IMAGE_REFERENCE", "应用镜像引用无效")
         path = self.data_dir / "journal" / f"{run_id}-{suffix}.json"
         atomic_write(path, json.dumps({"services": {name: {"image": image} for name, image in images.items()}}))
@@ -396,7 +537,7 @@ class HostUpdater:
 
     def _current_images(self, job: dict) -> dict[str, str]:
         images = {}
-        for service in APP_SERVICES:
+        for service in self._app_services():
             containers = self.runner(self._compose(self.root) + ["ps", "-q", service], cwd=self.root, timeout=30).splitlines()
             if len(containers) != 1 or not re.fullmatch(r"[a-f0-9]{12,64}", containers[0]):
                 raise UpdateError("COMPOSE_SERVICE_MISSING", "应用容器未就绪，升级尚未应用")
@@ -424,9 +565,10 @@ class HostUpdater:
         return {"python": python.relative_to(self.root).as_posix()}
 
     def _prepare_compose(self, job: dict, stage: Path) -> dict:
-        images = {service: f"price-monitor-update-{job['run_id']}-{service}:prepared" for service in APP_SERVICES}
+        services = self._app_services(stage)
+        images = {service: f"price-monitor-update-{job['run_id']}-{service}:prepared" for service in services}
         override = self._image_override(job["run_id"], images, "target-images")
-        self.runner(self._compose(stage, override) + ["build", *APP_SERVICES], cwd=self.root, timeout=2400)
+        self.runner(self._compose(stage, override) + ["build", *services], cwd=self.root, timeout=2400)
         return {"images": images}
 
     def _snapshot(self, job: dict, target_files: set[str]) -> dict:
@@ -490,15 +632,20 @@ class HostUpdater:
         if self.mode == "native":
             self.runner(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(self.root / "scripts/native.ps1"), "-Action", "stop-app"], cwd=self.root, timeout=180)
         else:
-            self.runner(self._compose(self.root) + ["stop", "--timeout", "90", "beat", "worker", "api", "web"], cwd=self.root, timeout=150)
+            services = self._app_services()
+            order = [name for name in ('beat', 'ai-worker', 'worker', 'api', 'web') if name in services]
+            self.runner(self._compose(self.root) + ["stop", "--timeout", "150", *order], cwd=self.root, timeout=210)
 
     def _start(self, job: dict, activation: dict) -> None:
         if self.mode == "native":
             python = self._validate_python(activation["python"])
             self.runner(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(self.root / "scripts/native.ps1"), "-Action", "restart-app", "-PythonExe", str(python)], cwd=self.root, timeout=240)
         else:
+            services = self._app_services()
+            if set(activation['images']) != set(services):
+                raise UpdateError('INVALID_IMAGE_REFERENCE', '镜像备份与该版本的应用服务不匹配')
             override = self._image_override(job["run_id"], activation["images"], "activate-images")
-            self.runner(self._compose(self.root, override) + ["up", "-d", "--no-build", "--no-deps", "--wait", "--wait-timeout", "240", *APP_SERVICES], cwd=self.root, timeout=300)
+            self.runner(self._compose(self.root, override) + ["up", "-d", "--no-build", "--no-deps", "--wait", "--wait-timeout", "240", *services], cwd=self.root, timeout=300)
 
     def _replace_files(self, source_root: Path, files: set[str], *, delete: set[str] = frozenset()) -> None:
         for name in sorted(files):

@@ -46,8 +46,8 @@ def prepare_update_config(root: Path) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[1] / ".env")
-    parser.add_argument("--admin-username", default="admin")
-    parser.add_argument("--quiet-secret", action="store_true", help="Do not print the generated admin password")
+    parser.add_argument("--admin-username", default=os.getenv("ADMIN_USERNAME", "admin"))
+    parser.add_argument("--quiet-secret", action="store_true", help="Do not print installation account passwords")
     parser.add_argument("--native", action="store_true", help="Use project-local PostgreSQL/Redis ports")
     parser.add_argument("--prepare-config-only", action="store_true", help="Create missing public update config without changing existing secrets")
     args = parser.parse_args()
@@ -63,13 +63,23 @@ def main() -> int:
         parser.exit(1, f"Refusing to overwrite existing secrets: {output}\n")
     if not args.admin_username or any(c in args.admin_username for c in "\r\n=# "):
         parser.error("Admin username must not contain whitespace, #, or =")
-    password = secrets.token_urlsafe(24)
+    password = os.getenv("ADMIN_PASSWORD", "admin888")
+    viewer_username = os.getenv("DEFAULT_USER_USERNAME", "user")
+    viewer_password = os.getenv("DEFAULT_USER_PASSWORD", "user123")
+    if (not viewer_username or any(c in viewer_username for c in "\r\n=# ")
+            or viewer_username == args.admin_username):
+        parser.error("Default user username must be valid and different from admin")
+    if any(not 7 <= len(value) <= 256 or any(c in value for c in "\r\n")
+           for value in (password, viewer_password)):
+        parser.error("Installation account passwords must contain 7 to 256 characters and no newlines")
     values = {
         "POSTGRES_USER": "price_monitor",
         "POSTGRES_DB": "price_monitor",
         "POSTGRES_PASSWORD": secrets.token_urlsafe(32),
         "ADMIN_USERNAME": args.admin_username,
         "ADMIN_PASSWORD": password,
+        "DEFAULT_USER_USERNAME": viewer_username,
+        "DEFAULT_USER_PASSWORD": viewer_password,
         "SESSION_SECRET": secrets.token_urlsafe(48),
         "ENCRYPTION_KEY": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii"),
         "COOKIE_SECURE": "false",
@@ -97,6 +107,8 @@ def main() -> int:
     print(f"Admin username: {args.admin_username}")
     if not args.quiet_secret:
         print(f"Admin password: {password}")
+        print(f"Default user username: {viewer_username}")
+        print(f"Default user password: {viewer_password}")
     else:
         print("Admin password was saved to .env and was not printed.")
     print("Keep .env securely; ENCRYPTION_KEY is required to recover platform sessions.")

@@ -46,12 +46,19 @@ def current_user(request: Request, db: Session = Depends(get_db)) -> User:
     return user
 
 
+def csrf_matches(supplied, expected) -> bool:
+    # compare_digest(str, str) rejects non-ASCII input with TypeError. Invalid
+    # untrusted header bytes must produce a 403, never an application crash.
+    return (isinstance(supplied, str) and isinstance(expected, str) and bool(expected)
+            and hmac.compare_digest(supplied.encode('utf-8'), expected.encode('utf-8')))
+
+
 def admin_user(request: Request, user: User = Depends(current_user)) -> User:
     if user.role != 'admin':
         raise HTTPException(403, '需要管理员权限')
     supplied = request.headers.get('X-CSRF-Token', '')
     expected = request.session.get('csrf', '')
-    if request.method not in ('GET', 'HEAD', 'OPTIONS') and (not expected or not hmac.compare_digest(supplied, expected)):
+    if request.method not in ('GET', 'HEAD', 'OPTIONS') and not csrf_matches(supplied, expected):
         raise HTTPException(403, '请求校验失败，请刷新后重试')
     return user
 

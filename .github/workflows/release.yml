@@ -69,9 +69,28 @@ jobs:
         working-directory: frontend
         run: |
           npm ci
+          npm test
           npm run build
-      - name: Run isolated real Docker upgrade and rollback drill
-        run: python scripts/docker_update_smoke.py --run
+      - name: Check out audited four-service baseline for compatibility drill
+        uses: actions/checkout@v4
+        with:
+          ref: v1.2.1
+          path: .runtime/baseline
+          persist-credentials: false
+      - name: Preserve existing AI data through current Docker upgrade and rollback
+        run: python scripts/docker_update_smoke.py --run --report .runtime/docker-ai-current-smoke.json
+      - name: Upgrade audited four-service release to five services and roll back
+        run: python scripts/docker_update_smoke.py --run --baseline-root .runtime/baseline --report .runtime/docker-ai-smoke.json
+      - name: Save sanitized Docker acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-ai-smoke-evidence
+          path: |
+            .runtime/docker-ai-smoke.json
+            .runtime/docker-ai-current-smoke.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Build and independently verify allowlisted release
         run: |
           python scripts/package_release.py --revision "$GITHUB_SHA"

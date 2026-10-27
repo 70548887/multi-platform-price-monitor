@@ -1,14 +1,16 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, auth, json, loadUser } from '../api'
 import Icon from '../components/Icon.vue'
+import { loginDestination } from '../navigation'
 const username = ref(''),
   password = ref(''),
   busy = ref(false),
   error = ref(''),
   route = useRoute(),
   router = useRouter()
+const adminLogin = computed(() => route.path === '/admin/login')
 async function submit() {
   busy.value = true
   error.value = ''
@@ -21,8 +23,7 @@ async function submit() {
     await loadUser()
     if (!auth.user) throw new Error('登录会话未能建立，请检查浏览器 Cookie 设置。')
     password.value = ''
-    const dest = String(route.query.redirect ?? '/')
-    await router.replace(dest.startsWith('/') && !dest.startsWith('//') ? dest : '/')
+    await router.replace(loginDestination(route.query.redirect, auth.user.role, adminLogin.value))
   } catch (e: any) {
     error.value = e.message
   } finally {
@@ -66,8 +67,10 @@ async function submit() {
     <section class="login-form-section">
       <form class="login-form" @submit.prevent="submit">
         <div class="login-icon"><Icon name="shield" :size="26" /></div>
-        <h2>登录工作空间</h2>
-        <p class="muted">使用团队账号访问价格监控平台</p>
+        <h2>{{ adminLogin ? '登录管理后台' : '成员登录' }}</h2>
+        <p class="muted">
+          {{ adminLogin ? '使用管理员账号维护平台、成员与系统' : '查看管理员分配给你的平台数据' }}
+        </p>
         <div v-if="error" role="alert" class="notice error">{{ error }}</div>
         <label
           >用户名<input
@@ -85,8 +88,12 @@ async function submit() {
             placeholder="请输入密码"
             :disabled="busy" /></label
         ><button class="btn btn-primary login-submit" :disabled="busy">
-          {{ busy ? '正在登录…' : '登录工作空间' }}<Icon name="arrow" :size="18" />
+          {{ busy ? '正在登录…' : adminLogin ? '登录管理后台' : '登录查看中心'
+          }}<Icon name="arrow" :size="18" />
         </button>
+        <RouterLink :to="adminLogin ? '/login' : '/admin/login'" class="text-link">{{
+          adminLogin ? '前往成员登录' : '管理员登录'
+        }}</RouterLink>
         <p class="login-help">
           <Icon name="shield" :size="14" />仅限团队成员访问，账号由管理员分配
         </p>

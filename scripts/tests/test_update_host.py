@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from urllib.request import Request
@@ -25,6 +26,45 @@ from app.update_common import read_signed_json, write_signed_json  # noqa: E402
 
 
 SECRET = "local-fixture-signing-key-with-more-than-thirty-two-chars"
+
+
+class CommandRunnerTests(unittest.TestCase):
+    def test_success_preserves_arguments_and_collects_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            heartbeats = []
+            result = update_host.CommandRunner(lambda: heartbeats.append(True))(
+                [sys.executable, '-c', 'import sys; print(sys.argv[1])', 'fixture with spaces'],
+                cwd=Path(directory), timeout=10)
+            self.assertEqual(result, 'fixture with spaces')
+            self.assertTrue(heartbeats)
+
+    def test_successful_service_launcher_keeps_its_redirected_child_running(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / 'started-child.txt'
+            child = "import time,pathlib; time.sleep(0.5); pathlib.Path(" + repr(str(marker)) + ").write_text('started')"
+            command = ('import subprocess,sys; subprocess.Popen([sys.executable,"-c",' + repr(child)
+                       + '],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); print("launched")')
+            result = update_host.CommandRunner(lambda: None)([sys.executable, '-c', command], cwd=root, timeout=5)
+            self.assertEqual(result, 'launched')
+            deadline = time.monotonic() + 3
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(marker.exists(), 'The successful launcher killed its service child')
+
+    def test_timeout_kills_descendant_and_does_not_wait_for_its_stdout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / 'escaped-child.txt'
+            child = "import time,pathlib; time.sleep(4.5); pathlib.Path(" + repr(str(marker)) + ").write_text('orphan')"
+            command = 'import subprocess,sys,time; subprocess.Popen([sys.executable,"-c",' + repr(child) + ']); time.sleep(30)'
+            started = time.monotonic()
+            with self.assertRaises(UpdateError) as caught:
+                update_host.CommandRunner(lambda: None)([sys.executable, '-c', command], cwd=root, timeout=2)
+            self.assertEqual(caught.exception.code, 'COMMAND_TIMEOUT')
+            self.assertLess(time.monotonic() - started, 3.8)
+            time.sleep(3)
+            self.assertFalse(marker.exists(), 'A timed-out command left a running descendant')
 
 
 def application_tree(root: Path, version="1.0.0", *, dist=True):

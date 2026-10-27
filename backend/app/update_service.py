@@ -21,6 +21,7 @@ from .models import AuditLog, UpdateRun, utcnow
 from .update_common import UpdateError, compare_versions, read_signed_json, verify_document, write_signed_json
 from .update_config import load_update_config
 from .update_github import GitHubReleaseClient, ReleaseInfo
+from .update_network import github_network_config, public_network_config
 from .version import VERSION
 
 LOCK_KEY = 'pm:update:global'
@@ -291,7 +292,8 @@ async def check_update(actor=None):
         db.add(AuditLog(user_id=run.actor_id, action='update_check', target=str(run.id)))
         db.commit()
         try:
-            release = await GitHubReleaseClient(settings).check(VERSION)
+            network = github_network_config(settings, db)
+            release = await GitHubReleaseClient(network).check(VERSION)
             lease.assert_owned()
             if release is None:
                 run.status, run.message, run.completed_at = 'up_to_date', '当前没有可升级的正式发布包', utcnow()
@@ -355,7 +357,8 @@ async def download_run(run_id, lease):
                                     'downloaded_bytes': size, 'total_bytes': total or 0}
                     run.updated_at = utcnow()
                     db.commit()
-                result = await GitHubReleaseClient(settings).download(release, destination, progress_callback=progress)
+                network = github_network_config(settings, db)
+                result = await GitHubReleaseClient(network).download(release, destination, progress_callback=progress)
                 lease.assert_owned()
                 run.package = result.path.relative_to(settings.runtime_dir).as_posix()
                 run.sha256 = result.sha256

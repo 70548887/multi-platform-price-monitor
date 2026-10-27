@@ -41,6 +41,7 @@ from sqlalchemy import select, func
 from app.db import SessionLocal
 from app.models import Platform, Rule, CollectionRun, Product, Observation, utcnow
 from app.security import encrypt_session, decrypt_session
+from app.tasks import redis_client
 with SessionLocal() as db:
     if SEED:
         if db.scalar(select(func.count()).select_from(Platform)):
@@ -70,6 +71,7 @@ with SessionLocal() as db:
                            display_quantity=Decimal('1000'), unit='person', status='active',
                            raw={'price':'0.007486','price_show_num':'1000'}))
         db.commit()
+        redis_client().set('pm:docker-smoke:retained', 'fixed-redis-fixture-no-credentials')
     platform = db.scalar(select(Platform).where(Platform.account_label=='smoke-fixture-account'))
     if not platform or platform.enabled:
         raise RuntimeError('Disabled fixture platform was not preserved')
@@ -80,13 +82,103 @@ with SessionLocal() as db:
     session = decrypt_session(platform.encrypted_session)
     if session!='fixture-session-no-upstream-request':
         raise RuntimeError('Encrypted fixture session was not preserved')
+    redis_value = redis_client().get('pm:docker-smoke:retained')
+    if redis_value!='fixed-redis-fixture-no-credentials':
+        raise RuntimeError('Redis fixture was not preserved')
     payload = {'platform_count':db.scalar(select(func.count()).select_from(Platform)),
                'product_count':db.scalar(select(func.count()).select_from(Product)),
                'observation_count':db.scalar(select(func.count()).select_from(Observation)),
                'rule_id':observation.rule_id, 'run_id':observation.run_id,
                'price':str(product.price), 'observed_price':str(observation.price),
                'display_quantity':str(product.display_quantity), 'raw':observation.raw,
-               'encrypted_session':platform.encrypted_session, 'session':session}
+               'encrypted_session':platform.encrypted_session, 'session':session, 'redis_fixture':redis_value}
+    print(hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest())
+'''
+
+
+# These records are deliberately inactive and use only fixed fixture values.
+# No model endpoint, source account or production configuration is copied.
+AI_SEED_SCRIPT = '''
+from sqlalchemy import select, func
+from app.db import SessionLocal
+from app.models import (AISettings, AIAnalysisRun, AIAnalysisBatch, AIDailyQuota,
+    AIProductCheck, AISuggestion, AIApplication, ComparisonCategory, CanonicalProduct,
+    Product, utcnow)
+from app.security import encrypt_session
+with SessionLocal() as db:
+    if db.scalar(select(func.count()).select_from(AIAnalysisRun)):
+        raise RuntimeError('AI smoke fixture database was not empty')
+    product = db.scalar(select(Product).where(Product.source_id=='9585'))
+    if product is None:
+        raise RuntimeError('Base price fixture is required')
+    now = utcnow()
+    category = ComparisonCategory(name='AI smoke fixture category')
+    db.add(category); db.flush()
+    group = CanonicalProduct(name='AI smoke fixture group', category_id=category.id,
+        unit=product.unit, currency=product.currency, match_mode='similar', mapping_revision=1)
+    db.add(group); db.flush()
+    db.add(AISettings(id=1, enabled=False, auto_apply=False,
+        base_url='https://model.invalid/v1', model='fixture-no-network',
+        encrypted_key=encrypt_session('fixed-fixture-key-no-network'),
+        daily_product_limit=1000, daily_request_limit=20))
+    run = AIAnalysisRun(dedupe_key='docker-smoke-completed', status='succeeded',
+        stage='succeeded', trigger='manual', model='fixture-no-network',
+        settings_revision=1, planned_count=1, checked_count=1,
+        snapshot={'fixture_only':True,'sample_count':1},
+        report={'summary':'Fixed AI smoke report','findings':[]},
+        started_at=now, completed_at=now)
+    db.add(run); db.flush()
+    snapshot = {'id':product.id,'name':product.name,'platform_id':product.platform_id,
+                'price':str(product.price),'display_quantity':str(product.display_quantity)}
+    batch = AIAnalysisBatch(run_id=run.id, ordinal=1, status='succeeded',
+        product_ids=[product.id], snapshot={'products':[snapshot]},
+        report={'summary':'Fixed AI batch report','findings':[]},
+        usage={'prompt_tokens':10,'completion_tokens':5,'total_tokens':15},
+        request_day='2026-01-01', started_at=now, completed_at=now)
+    db.add(batch); db.flush()
+    db.add(AIDailyQuota(day='2026-01-01', products_used=1, requests_used=1))
+    db.add(AIProductCheck(product_id=product.id, fingerprint='a'*64,
+                         last_checked_at=now, last_batch_id=batch.id))
+    suggestion = AISuggestion(run_id=run.id, batch_id=batch.id, kind='group',
+        status='applied', category_id=category.id, proposed_category_path=category.name,
+        group_id=group.id, group_name=group.name, reason='Fixed fixture only',
+        products=[snapshot], dedupe_key='b'*64)
+    db.add(suggestion); db.flush()
+    application = AIApplication(suggestion_id=suggestion.id, mode='auto', status='applied',
+        group_id=group.id, group_name=group.name, category_path=category.name,
+        products=[snapshot], before={'fixture_only':True,'canonical_id':None},
+        after={'fixture_only':True,'canonical_id':group.id})
+    db.add(application); db.flush()
+    product.canonical_id, product.mapping_origin = group.id, 'ai'
+    product.mapping_revision, product.ai_application_id = 1, application.id
+    db.commit()
+print('fixture_seeded')
+'''
+
+
+# Raw SQL is intentional: after rollback the old application has no AI ORM
+# classes, but additive tables and their exact records must still be preserved.
+AI_FINGERPRINT_SCRIPT = '''
+import hashlib, json
+from sqlalchemy import text
+from app.db import engine
+tables = {
+    'ai_settings':'id', 'ai_analysis_runs':'id', 'ai_analysis_batches':'id',
+    'ai_daily_quotas':'day', 'ai_product_checks':'product_id', 'ai_suggestions':'id',
+    'ai_applications':'id', 'comparison_categories':'id', 'canonical_products':'id'}
+with engine.connect() as conn:
+    conn.execute(text('SET TRANSACTION READ ONLY'))
+    payload = {}
+    for table, ordering in tables.items():
+        rows = conn.execute(text('SELECT row_to_json(t)::text FROM '+table+' t ORDER BY '+ordering)).scalars().all()
+        if not rows:
+            raise RuntimeError('An AI fixture table was empty after upgrade or rollback')
+        payload[table] = [json.loads(row) for row in rows]
+    payload['product_mapping'] = [dict(row) for row in conn.execute(text(
+        "SELECT id, canonical_id, mapping_revision, mapping_origin, ai_application_id "
+        "FROM products WHERE source_id='9585' ORDER BY id")).mappings()]
+    if len(payload['product_mapping'])!=1 or payload['product_mapping'][0]['mapping_origin']!='ai':
+        raise RuntimeError('AI association provenance was not preserved')
     print(hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest())
 '''
 
@@ -128,8 +220,19 @@ def data_fingerprint(runner, compose, root, *, seed=False) -> str:
     return output
 
 
-def copy_release_tree(source: Path, target: Path) -> None:
-    for name, path in collect_files(source, require_dist=True).items():
+def ai_data_fingerprint(runner, compose, root, *, seed=False) -> str:
+    if seed:
+        output = runner(compose + ['exec', '-T', 'api', 'python', '-c', AI_SEED_SCRIPT], cwd=root, timeout=60)
+        if output != 'fixture_seeded':
+            raise SmokeFailure('AI fixture seeding response was invalid')
+    output = runner(compose + ['exec', '-T', 'api', 'python', '-c', AI_FINGERPRINT_SCRIPT], cwd=root, timeout=60)
+    if len(output) != 64 or any(character not in '0123456789abcdef' for character in output):
+        raise SmokeFailure('AI database fingerprint response was invalid')
+    return output
+
+
+def copy_release_tree(source: Path, target: Path, *, require_dist=True) -> None:
+    for name, path in collect_files(source, require_dist=require_dist).items():
         output = target / name
         output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, output)
@@ -163,14 +266,20 @@ def availability_problem() -> str | None:
     return None
 
 
-def exercise(source: Path, report: dict) -> None:
+def exercise(source: Path, report: dict, *, baseline_root: Path | None = None) -> None:
     source = source.resolve()
+    baseline = baseline_root.resolve() if baseline_root else source
     revision = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
     if len(revision) != 40 or any(char not in '0123456789abcdef' for char in revision):
         raise SmokeFailure('A full source revision is required')
-    base_version = version_from_source(source)
+    baseline_revision = subprocess.check_output(['git','-C',str(baseline),'rev-parse','HEAD'],text=True).strip() if baseline_root else revision
+    if len(baseline_revision)!=40 or any(char not in '0123456789abcdef' for char in baseline_revision):
+        raise SmokeFailure('A full baseline revision is required')
+    base_version = version_from_source(baseline)
     major, minor, patch = (int(part) for part in base_version.split('.'))
-    target_version = f'{major}.{minor}.{patch + 1}'
+    source_version = version_from_source(source)
+    candidate = f'{major}.{minor}.{patch + 1}'
+    target_version = source_version if tuple(map(int,source_version.split('.'))) > (major,minor,patch) else candidate
     project = 'price-monitor-smoke-' + secrets.token_hex(8)
     root = Path(tempfile.mkdtemp(prefix=project + '-', dir=os.getenv('RUNNER_TEMP') or None)).resolve()
     workspace_parent = root.parent
@@ -194,11 +303,15 @@ def exercise(source: Path, report: dict) -> None:
     compose = ['docker', 'compose', '--project-name', project, '--project-directory', str(root),
                '--env-file', str(root / '.env'), '-f', str(root / 'docker-compose.yml')]
     attempted_start = False
-    report.update(project=project, source_revision=revision, initial_version=base_version, target_version=target_version)
+    report.update(project=project, source_revision=revision, initial_version=base_version, target_version=target_version,
+                  fixture_only=True, baseline_mode='old_release' if baseline_root else 'current_source')
+    if baseline_root:
+        report['baseline_revision'] = baseline_revision
     try:
         report['phase'] = 'prepare_isolated_installation'
-        copy_release_tree(source, root)
+        copy_release_tree(baseline, root, require_dist=not bool(baseline_root))
         atomic_write(root / '.env', '\n'.join(f'{key}={value}' for key, value in values.items()) + '\n')
+        initial_env_hash = hashlib.sha256((root / '.env').read_bytes()).hexdigest()
         (root / 'config/update.yaml').write_bytes((root / 'config/update.example.yaml').read_bytes())
         (root / 'config/update.yaml').chmod(0o644)
         for path in (root / 'data/update', root / 'data/backups'):
@@ -217,8 +330,13 @@ def exercise(source: Path, report: dict) -> None:
                     'repository': 'acceptance-fixture/price-monitor', 'auto_restart': True}
         updater._wait_health(base_job, base_version)
         report['initial_health'] = True
+        report['initial_services'] = list(updater._app_services())
         baseline_data = data_fingerprint(runner, compose, root, seed=True)
         report['baseline_data_fingerprint'] = baseline_data
+        baseline_ai = None
+        if 'ai-worker' in updater._app_services():
+            baseline_ai = ai_data_fingerprint(runner,compose,root,seed=True)
+            report['baseline_ai_data_fingerprint'] = baseline_ai
 
         report['phase'] = 'build_target_fixture_release'
         target = root / 'data/target-source'
@@ -237,9 +355,20 @@ def exercise(source: Path, report: dict) -> None:
             report['error_code'] = (applied or {}).get('error_code')
             raise SmokeFailure('Real upgrade did not pass target-version health checks')
         report.update(apply_status='succeeded', upgraded_health=True)
+        report['upgraded_services'] = list(updater._app_services())
+        if 'ai-worker' not in updater._app_services():
+            raise SmokeFailure('Target release did not start the independent AI worker')
         if data_fingerprint(runner, compose, root) != baseline_data:
             raise SmokeFailure('Upgrade changed the encrypted session or exact price history fixture')
         report['upgrade_data_preserved'] = True
+        if hashlib.sha256((root / '.env').read_bytes()).hexdigest() != initial_env_hash:
+            raise SmokeFailure('Upgrade changed the isolated environment file')
+        upgraded_ai = ai_data_fingerprint(runner,compose,root,seed=baseline_ai is None)
+        if baseline_ai and upgraded_ai != baseline_ai:
+            raise SmokeFailure('Upgrade changed the AI report, quota or association fixture')
+        report['ai_data_fingerprint'] = upgraded_ai
+        report['ai_upgrade_data_preserved'] = baseline_ai is not None
+        report['ai_tables_created_by_upgrade'] = baseline_ai is None
         rollback_id = run_id + 2000000000
         rollback_job = {'protocol': 1, 'run_id': rollback_id, 'action': 'rollback',
                         'current_version': target_version, 'target_version': base_version, 'tag': 'v' + base_version,
@@ -257,7 +386,15 @@ def exercise(source: Path, report: dict) -> None:
         if data_fingerprint(runner, compose, root) != baseline_data:
             raise SmokeFailure('Rollback changed the encrypted session or exact price history fixture')
         report.update(rollback_status='rolled_back', restored_health=True, data_preserved=True,
-                      rollback_data_preserved=True, status='passed', phase='complete')
+                      rollback_data_preserved=True)
+        report['restored_services'] = list(updater._app_services())
+        if ai_data_fingerprint(runner,compose,root) != upgraded_ai:
+            raise SmokeFailure('Rollback changed the AI report, quota or association fixture')
+        report['ai_rollback_data_preserved'] = True
+        if hashlib.sha256((root / '.env').read_bytes()).hexdigest() != initial_env_hash:
+            raise SmokeFailure('Rollback changed the isolated environment file')
+        report['environment_and_redis_preserved'] = True
+        report.update(status='passed', phase='complete')
     finally:
         if report.get('status') != 'passed' and runner.last_error:
             report['diagnostic'] = runner.last_error
@@ -284,6 +421,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', action='store_true', help='Explicitly permit disposable real Docker containers and volumes')
     parser.add_argument('--root', type=Path, default=SCRIPT_ROOT.parent)
+    parser.add_argument('--baseline-root',type=Path,help='Optional audited old checkout used for the initial installation')
     parser.add_argument('--report', type=Path, help='Write a sanitized acceptance report outside the temporary installation')
     args = parser.parse_args()
     report = {'kind': 'docker_update_acceptance', 'at': datetime.now(timezone.utc).isoformat(), 'status': 'not_executed'}
@@ -293,7 +431,7 @@ def main() -> int:
         code = 2
     else:
         try:
-            exercise(args.root, report)
+            exercise(args.root, report, baseline_root=args.baseline_root)
             code = 0 if report.get('status') == 'passed' else 1
         except Exception:
             report['status'] = 'failed'
