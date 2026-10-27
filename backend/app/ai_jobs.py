@@ -119,12 +119,14 @@ def run_progress(db, run, detail=False):
         return result
     batches = list(db.scalars(select(AIAnalysisBatch).where(AIAnalysisBatch.run_id==run.id).order_by(AIAnalysisBatch.ordinal)))
     known = [b.usage for b in batches if b.usage]
-    usage = {key:sum(u.get(key,0) for u in known) for key in ('prompt_tokens','completion_tokens','total_tokens')} if known else None
+    fields=[key for key in ('prompt_tokens','completion_tokens','total_tokens') if any(key in u for u in known)]
+    usage = {key:sum(u[key] for u in known if key in u) for key in fields} if fields else None
     result = {'stage':run.stage,'planned_count':run.planned_count,'checked_count':run.checked_count,
               'failed_count':run.failed_count,'batch_count':len(batches),
               'completed_batches':sum(b.status not in BATCH_ACTIVE for b in batches),
               'stop_requested':run.stop_requested,'usage':usage,
-              'usage_partial':len(known)<sum(b.started_at is not None for b in batches)}
+              'usage_partial':len(known)<sum(b.started_at is not None for b in batches)
+                              or any(any(key not in u for u in known) for key in fields)}
     if detail:
         result['batches'] = [batch_dict(b,True) for b in batches]
     return result

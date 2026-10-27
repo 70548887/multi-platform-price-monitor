@@ -80,3 +80,17 @@ async def test_anthropic_diagnostic_uses_protocol_headers_without_inference():
         return httpx.Response(200,json={'data':[{'id':'fixture-model'}]})
     result=await check_connection(service.Connection('https://ai.example.org/v1','fixture-model',KEY,api_format='anthropic_messages'),1,transport=httpx.MockTransport(handler))
     assert result['status']=='connected'
+
+
+def test_report_usage_does_not_invent_total_for_messages_api(admin_client,db):
+    from app.models import AIAnalysisBatch
+    from app.ai_jobs import run_progress
+    configure(admin_client,api_format='anthropic_messages')
+    task=service.create_analysis()
+    run=db.get(AIAnalysisRun,task['id'])
+    db.add_all([AIAnalysisBatch(run_id=run.id,ordinal=ordinal,status='succeeded',
+        product_ids=[ordinal],usage={'prompt_tokens':10,'completion_tokens':5}) for ordinal in (1,2)])
+    db.commit()
+    progress=run_progress(db,run)
+    assert progress['usage']=={'prompt_tokens':20,'completion_tokens':10}
+    assert progress['usage_partial'] is False
