@@ -113,7 +113,14 @@ def runtime_workers(prefix, evidence, queues):
         for job in jobs.values():job.close()
         for process in processes.values():
             if process.poll() is None and os.name!='nt':process.terminate()
-            process.wait(timeout=8)
+            try:
+                process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                # Celery treats SIGTERM as a warm drain, which may wait on a
+                # deliberately blocked fixture request. This Popen owns only
+                # our direct test worker, so bounded cleanup can force exit.
+                process.kill()
+                process.wait(timeout=8)
         client.close()
 
 
@@ -176,7 +183,7 @@ def test_actual_ai_worker_crash_is_uncertain_and_redelivery_never_repeats_reques
             # model fixture gate is still closed, so no response was received.
             original.jobs['ai'].close()
             process=original.processes['ai']
-            if os.name!='nt':process.terminate()
+            if os.name!='nt':process.kill()
             process.wait(timeout=8)
             assert process.poll() is not None
             db.expire_all()
