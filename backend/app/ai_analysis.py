@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
 from sqlalchemy import case, func, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 
-from .ai_config import endpoint_url
+from .ai_config import endpoint_url,validate_inference_options
 from .category_tree import CategoryTree
 from .db import SessionLocal
 from .models import AISettings, AIAnalysisRun, AuditLog, CanonicalProduct, CollectionRun, Event, Observation, Platform, Product, utcnow
@@ -74,6 +74,9 @@ class Connection:
     key: str = field(repr=False)
     proxy: str | None = field(default=None, repr=False)
     json_mode: bool = True
+    api_format: str = 'chat_completions'
+    reasoning_effort: str = 'auto'
+    max_output_tokens: int = 4000
 
 
 def settings_connection(db, settings):
@@ -81,15 +84,18 @@ def settings_connection(db, settings):
         raise AnalysisError('AI_NOT_CONFIGURED', '请先在系统设置中配置 AI 接口、模型和 Key')
     try:
         url = endpoint_url(settings.base_url)
+        validate_inference_options(settings.api_format,settings.reasoning_effort,settings.max_output_tokens,url)
         key = decrypt_session(settings.encrypted_key)
         proxy = get_platform_proxy(db, settings) if settings.proxy_route != 'direct' else None
     except Exception:
         raise AnalysisError('AI_CONFIGURATION_INVALID', 'AI 配置或代理无法读取，请检查系统设置') from None
-    return Connection(url, settings.model, key, proxy, settings.json_mode)
+    return Connection(url, settings.model, key, proxy, settings.json_mode,
+                      settings.api_format,settings.reasoning_effort,settings.max_output_tokens)
 
 
 def run_dict(row, *, detail=False):
     data = {'id': row.id, 'status': row.status, 'trigger': row.trigger, 'model': row.model,'schema_version':row.schema_version,
+            'api_format':row.api_format,'reasoning_effort':row.reasoning_effort,'max_output_tokens':row.max_output_tokens,
             'message': row.message, 'error_code': row.error_code, 'created_at': iso(row.created_at),
             'started_at': iso(row.started_at), 'completed_at': iso(row.completed_at),
             'summary': row.report.get('summary', '') if row.report else '',
@@ -201,6 +207,7 @@ category_suggestions([{product_id,category_path,group_name,reason}])，group_sug
 
 
 async def fetch_report(connection, data, *, transport=None):
+    from .ai_protocols import build_request,parse_response,ProtocolResponseError
     host = httpx.URL(connection.base_url).host
     if transport is None:
         try:
@@ -212,16 +219,14 @@ async def fetch_report(connection, data, *, transport=None):
     payload = json.dumps(data,ensure_ascii=False,separators=(',',':'))
     if len(payload.encode('utf-8'))>200000:
         raise AnalysisError('AI_INPUT_TOO_LARGE','分析摘要超过大小限制，请减小商品样本数')
-    token_parameter = 'max_completion_tokens' if re.match(r'^(?:gpt-[5-9](?:\.|-|$)|o[1-9](?:-|$))',connection.model) else 'max_tokens'
-    body = {'model':connection.model,'messages':[{'role':'system','content':SYSTEM_PROMPT},
-        {'role':'user','content':payload}], token_parameter:4000}
-    if connection.json_mode:
-        body['response_format'] = {'type':'json_object'}
+    try:
+        path,headers,body=build_request(connection,payload,SYSTEM_PROMPT,AIReport.model_json_schema())
+    except ValueError:
+        raise AnalysisError('AI_CONFIGURATION_INVALID','接口类型、思考等级或输出限制配置无效') from None
     try:
         async with httpx.AsyncClient(proxy=connection.proxy, transport=transport,
                 timeout=httpx.Timeout(100,connect=15), follow_redirects=False, trust_env=False) as client:
-            async with client.stream('POST', connection.base_url + '/chat/completions',
-                    headers={'Authorization':'Bearer '+connection.key,'Accept':'application/json'},json=body) as response:
+            async with client.stream('POST', connection.base_url + path, headers=headers,json=body) as response:
                 if response.status_code in (401,403):
                     raise AnalysisError('AI_AUTH_FAILED', 'AI 接口拒绝访问，请检查 Key、模型和权限')
                 if response.status_code == 429:
@@ -232,9 +237,11 @@ async def fetch_report(connection, data, *, transport=None):
                         diagnostic.extend(chunk[:16000-len(diagnostic)])
                         if len(diagnostic)>=16000:break
                     hint=diagnostic.decode('utf-8',errors='replace').lower()
-                    if response.status_code==400 and any(word in hint for word in ('response_format','json_object')):
+                    if response.status_code==400 and any(word in hint for word in ('response_format','json_object','json_schema','output_config.format','text.format')):
                         raise AnalysisError('AI_JSON_MODE_UNSUPPORTED','AI 接口不接受 JSON 模式参数，请在配置中关闭 JSON 模式后手动重试')
-                    if response.status_code==400 and any(word in hint for word in ('max_tokens','max_completion_tokens')):
+                    if response.status_code==400 and any(word in hint for word in ('reasoning_effort','reasoning.effort','thinking','output_config.effort')):
+                        raise AnalysisError('AI_REASONING_UNSUPPORTED','当前模型不支持所选思考等级，请选择自动或核对服务商支持范围')
+                    if response.status_code==400 and any(word in hint for word in ('max_tokens','max_completion_tokens','max_output_tokens')):
                         raise AnalysisError('AI_TOKEN_LIMIT_UNSUPPORTED','AI 接口不接受当前输出长度参数，请核对模型的兼容格式')
                     raise AnalysisError('AI_HTTP_FAILED', f'AI 接口返回 HTTP {response.status_code}，请核对模型、接口格式和服务状态')
                 content = bytearray()
@@ -243,12 +250,7 @@ async def fetch_report(connection, data, *, transport=None):
                     if len(content)>256*1024:
                         raise AnalysisError('AI_RESPONSE_TOO_LARGE','AI 响应超过大小限制')
         raw = json.loads(content)
-        choice = raw['choices'][0]
-        if choice.get('finish_reason') not in (None,'stop'):
-            raise ValueError
-        text_content = choice['message']['content']
-        if not isinstance(text_content,str):
-            raise ValueError
+        text_content,usage=parse_response(connection,raw)
         # Models must not be able to echo transport credentials into reports.
         for secret in (connection.key, connection.proxy):
             if secret:
@@ -266,10 +268,11 @@ async def fetch_report(connection, data, *, transport=None):
         if any(len(item.product_ids) != len(set(item.product_ids)) for item in report.group_suggestions):
             raise ValueError
         result = report.model_dump()
-        usage = raw.get('usage')
-        if isinstance(usage, dict):
-            result['_usage'] = {k:v for k,v in usage.items() if k in ('prompt_tokens','completion_tokens','total_tokens') and type(v) is int and v >= 0} or None
+        if usage is not None:
+            result['_usage']=usage
         return result
+    except ProtocolResponseError as exc:
+        raise AnalysisError(exc.code,exc.message) from None
     except AnalysisError:
         raise
     except httpx.HTTPError:

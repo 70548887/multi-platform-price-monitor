@@ -9,6 +9,9 @@ const config = ref<any>(null),
   error = ref(''),
   notice = ref('')
 const form = reactive({
+  api_format: 'chat_completions',
+  reasoning_effort: 'auto',
+  max_output_tokens: 4000,
   enabled: false,
   base_url: '',
   model: '',
@@ -21,6 +24,76 @@ const form = reactive({
   daily_request_limit: 20,
   auto_apply: false,
 })
+const protocolLabels: Record<string, string> = {
+  chat_completions: 'Chat Completions',
+  responses: 'Responses',
+  anthropic_messages: 'Anthropic Messages',
+}
+const endpointSuffix = computed(
+  () =>
+    ({
+      chat_completions: '/chat/completions',
+      responses: '/responses',
+      anthropic_messages: '/messages',
+    })[form.api_format] ?? '/chat/completions',
+)
+const officialOpenAI = computed(() => {
+  try {
+    return new URL(form.base_url).hostname.toLowerCase() === 'api.openai.com'
+  } catch {
+    return false
+  }
+})
+const reasoningLevels = computed(() => {
+  if (form.api_format === 'anthropic_messages')
+    return ['auto', 'low', 'medium', 'high', 'xhigh', 'max']
+  return [
+    'auto',
+    'none',
+    'minimal',
+    'low',
+    'medium',
+    'high',
+    'xhigh',
+    'max',
+    ...(officialOpenAI.value ? [] : ['ultra']),
+  ]
+})
+const reasoningLabels: Record<string, string> = {
+  auto: '自动（不发送思考参数）',
+  none: 'none · 不启用',
+  minimal: 'minimal · 最少',
+  low: 'low · 低',
+  medium: 'medium · 中',
+  high: 'high · 高',
+  xhigh: 'xhigh · 更高',
+  max: 'max · 最高',
+  ultra: 'ultra · 供应商扩展',
+}
+const formatNotice = ref('')
+function protocolChanged() {
+  invalidateDiagnostic()
+  if (!reasoningLevels.value.includes(form.reasoning_effort)) {
+    form.reasoning_effort = 'auto'
+    formatNotice.value = '当前接口类型不支持原思考等级，已在草稿中重置为“自动”；保存后生效。'
+  } else {
+    formatNotice.value = '接口格式已在草稿中修改；请核对服务商支持的格式并保存后检查连接。'
+  }
+}
+function baseAddressChanged() {
+  if (!reasoningLevels.value.includes(form.reasoning_effort)) {
+    form.reasoning_effort = 'auto'
+    formatNotice.value = '官方接口不使用 ultra 扩展，已在草稿中改为“自动”；保存后生效。'
+  }
+}
+function normalizedConfig(value: any) {
+  return {
+    api_format: 'chat_completions',
+    reasoning_effort: 'auto',
+    max_output_tokens: 4000,
+    ...value,
+  }
+}
 const clearConfirm = ref(false)
 const testing = ref(false),
   diagnostic = ref<any>(null),
@@ -108,6 +181,7 @@ function resetForm() {
   form.key = ''
   error.value = ''
   notice.value = ''
+  formatNotice.value = ''
 }
 let disposed = false
 async function load() {
@@ -117,8 +191,8 @@ async function load() {
   try {
     const value = await api('/ai-analysis/config')
     if (!disposed) {
-      config.value = value
-      resetFormAfterSave(value)
+      config.value = normalizedConfig(value)
+      resetFormAfterSave(config.value)
     }
   } catch (e: any) {
     if (!disposed) {
@@ -144,6 +218,9 @@ async function save() {
   saving.value = true
   try {
     const body = {
+      api_format: form.api_format,
+      reasoning_effort: form.reasoning_effort,
+      max_output_tokens: form.max_output_tokens,
       enabled: form.enabled,
       base_url: form.base_url.trim(),
       ...(form.model.trim() ? { model: form.model.trim() } : {}),
@@ -158,8 +235,9 @@ async function save() {
     }
     const value = await api('/ai-analysis/config', json('PUT', body))
     if (disposed) return
-    config.value = value
-    resetFormAfterSave(value)
+    config.value = normalizedConfig(value)
+    resetFormAfterSave(config.value)
+    formatNotice.value = ''
     notice.value = 'AI 配置已保存，密钥不会回显。'
   } catch (e: any) {
     if (!disposed) error.value = e.message
@@ -176,7 +254,7 @@ async function clearKey() {
   try {
     const value = await api('/ai-analysis/config', json('PUT', { clear_key: true }))
     if (disposed) return
-    config.value = value
+    config.value = normalizedConfig(value)
     form.key = ''
     form.enabled = false
     clearConfirm.value = false
@@ -229,7 +307,10 @@ onBeforeUnmount(() => {
         <span class="settings-icon"><Icon name="shield" :size="22" /></span>
         <div>
           <h3>分析服务配置</h3>
-          <p>兼容 OpenAI Chat Completions 接口</p>
+          <p>
+            {{ protocolLabels[form.api_format] }} · 思考等级
+            {{ form.reasoning_effort === 'auto' ? '自动' : form.reasoning_effort }}
+          </p>
         </div>
         <span
           class="badge"
@@ -248,6 +329,26 @@ onBeforeUnmount(() => {
             <p>填写服务商提供的地址、模型和密钥。</p>
           </div>
         </div>
+        <div class="ai-protocol-field">
+          <label class="settings-field" for="ai-api-format"
+            >接口类型<select
+              id="ai-api-format"
+              v-model="form.api_format"
+              :disabled="saving || testing"
+              @change="protocolChanged"
+            >
+              <option value="chat_completions">Chat Completions</option>
+              <option value="responses">Responses</option>
+              <option value="anthropic_messages">Anthropic Messages</option>
+            </select></label
+          >
+          <p class="settings-help">
+            选择服务商提供的请求格式，保存后按对应接口发送；不会失败后自动切换格式。
+          </p>
+          <div v-if="formatNotice" class="notice info ai-format-notice" role="status">
+            {{ formatNotice }}
+          </div>
+        </div>
         <div class="ai-config-grid">
           <div>
             <label class="settings-field" for="ai-base-url"
@@ -259,9 +360,11 @@ onBeforeUnmount(() => {
                 placeholder="https://AI服务域名/v1"
                 :disabled="saving"
                 aria-describedby="ai-base-help"
+                @change="baseAddressChanged"
             /></label>
             <p id="ai-base-help" class="settings-help">
-              填写公开 HTTPS 基础地址，例如 /v1；系统自动拼接 /chat/completions。
+              填写公开 HTTPS 基础地址，例如
+              /v1；也可填写完整接口路径，保存时会整理为基础地址。请求路径为 {{ endpointSuffix }}。
             </p>
           </div>
           <div>
@@ -281,6 +384,55 @@ onBeforeUnmount(() => {
             <p id="ai-model-help" class="settings-help">与服务商提供的模型标识保持一致。</p>
           </div>
         </div>
+        <details class="ai-inference-options" open>
+          <summary>思考与输出设置</summary>
+          <div class="ai-config-grid">
+            <div>
+              <label class="settings-field" for="ai-reasoning-effort"
+                >思考等级<select
+                  id="ai-reasoning-effort"
+                  v-model="form.reasoning_effort"
+                  :disabled="saving || testing"
+                >
+                  <option v-for="level in reasoningLevels" :key="level" :value="level">
+                    {{ reasoningLabels[level] }}
+                  </option>
+                </select></label
+              >
+              <p class="settings-help">
+                “自动”不发送额外思考参数。具体等级由模型及服务商决定；不支持时会报告错误，不会自动降级。
+              </p>
+            </div>
+            <div>
+              <label class="settings-field" for="ai-max-output-tokens"
+                >最大输出 Token<input
+                  id="ai-max-output-tokens"
+                  v-model.number="form.max_output_tokens"
+                  type="number"
+                  min="1024"
+                  max="32768"
+                  step="1"
+                  required
+                  :disabled="saving || testing"
+              /></label>
+              <p class="settings-help">
+                1,024–32,768。较高思考等级可能需要更多输出预算，也会增加耗时及用量。
+              </p>
+            </div>
+          </div>
+          <p
+            v-if="form.reasoning_effort === 'ultra'"
+            class="notice warning ai-format-notice"
+            role="status"
+          >
+            ultra 是供应商扩展，不是官方通用参数。仅在你的网关明确支持时使用；官方 OpenAI
+            地址不提供此选项。
+          </p>
+          <p v-if="form.api_format === 'anthropic_messages'" class="settings-help">
+            Anthropic 模式仅列出适配的等级；显式等级使用 adaptive
+            thinking，仍需模型支持。系统不会把等级伪换算为思考 Token。
+          </p>
+        </details>
         <div class="ai-key-field">
           <label class="settings-field" for="ai-api-key"
             ><span
@@ -603,6 +755,28 @@ onBeforeUnmount(() => {
 }
 .ai-key-field {
   margin-top: 22px;
+}
+.ai-protocol-field {
+  margin-bottom: 22px;
+}
+.ai-format-notice {
+  margin: 12px 0 0;
+}
+.ai-inference-options {
+  margin-top: 22px;
+  padding: 18px;
+  background: #f8faff;
+  border: 1px solid #e8eef8;
+  border-radius: 9px;
+}
+.ai-inference-options summary {
+  cursor: pointer;
+  color: #536a8a;
+  font-size: 12px;
+  font-weight: 600;
+}
+.ai-inference-options > .ai-config-grid {
+  margin-top: 18px;
 }
 .ai-connection-tools {
   margin-top: 20px;

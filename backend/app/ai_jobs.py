@@ -89,6 +89,7 @@ def create_run(actor_id=None, *, daily=False, now=None, retry_id=None):
         run = AIAnalysisRun(schema_version=2,
             dedupe_key='daily:'+day if daily else 'manual:'+uuid.uuid4().hex,
             trigger='daily' if daily else 'manual', actor_id=actor_id, model=settings.model,
+            api_format=settings.api_format,reasoning_effort=settings.reasoning_effort,max_output_tokens=settings.max_output_tokens,
             settings_revision=settings.revision, status='queued', stage='queued',
             message='等待独立 AI 工作进程执行', created_at=now, parent_run_id=retry_id)
         db.add(run);db.flush()

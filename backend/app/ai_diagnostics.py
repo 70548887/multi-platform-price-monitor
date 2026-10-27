@@ -24,6 +24,7 @@ def issue_description(code):
         'AI_AUTH_FAILED': ('AI 服务端拒绝访问，密钥或模型权限需要核对。', '在 AI 设置中检查已保存连接；模型列表可读取不代表推理额度可用。'),
         'AI_JSON_MODE_UNSUPPORTED': ('AI 接口不接受 JSON 模式参数。', '核对服务商兼容格式，可关闭 JSON 模式后手动重试。'),
         'AI_TOKEN_LIMIT_UNSUPPORTED': ('当前模型不接受输出长度参数。', '核对模型名称和接口兼容格式。'),
+        'AI_REASONING_UNSUPPORTED': ('当前模型不接受所选思考等级。', '在 AI 配置中改为自动，或核对服务商声明支持的等级后再重试。'),
         'AI_HTTP_FAILED': ('AI 服务返回错误响应，尚未生成有效分析报告。', '查看批次错误，并检查服务商状态、模型和接口配置。'),
         'AI_NETWORK_FAILED': ('AI 请求连接失败或中断。', '检查已保存的接口和代理线路，恢复后再手动重试。'),
         'AI_ENDPOINT_UNAVAILABLE': ('AI 域名解析失败或地址不符合公开接口要求。', '核对 Base URL 与服务器网络、DNS。'),
@@ -49,6 +50,7 @@ async def check_connection(connection, revision, *, transport=None):
                 'latency_ms':int((time.monotonic()-started)*1000),**fields}
 
     async def request():
+        from .ai_protocols import request_headers
         host=httpx.URL(connection.base_url).host
         if transport is None:
             try:
@@ -60,7 +62,7 @@ async def check_connection(connection, revision, *, transport=None):
         async with httpx.AsyncClient(proxy=connection.proxy,transport=transport,trust_env=False,
                 follow_redirects=False,timeout=httpx.Timeout(15,connect=8)) as client:
             async with client.stream('GET',connection.base_url+'/models',
-                headers={'Authorization':'Bearer '+connection.key,'Accept':'application/json'}) as remote:
+                headers=request_headers(connection)) as remote:
                 if remote.status_code in (401,403):
                     return response('failed','接口拒绝访问，请核对密钥、权限和地址。','AI_AUTH_FAILED',authenticated=False)
                 if remote.status_code==429:

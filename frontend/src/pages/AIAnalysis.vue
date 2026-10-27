@@ -197,6 +197,20 @@ const badge = (value: string) =>
         ? 'warning'
         : 'neutral'
 const stage = (item: any) => stageLabels[item?.stage] ?? label(item?.status)
+function protocolLabel(value: unknown) {
+  return (
+    (
+      {
+        chat_completions: 'Chat Completions',
+        responses: 'Responses',
+        anthropic_messages: 'Anthropic Messages',
+      } as Record<string, string>
+    )[String(value)] ?? '旧版格式未记录'
+  )
+}
+function reasoningLabel(value: unknown) {
+  return value === 'auto' ? '自动' : typeof value === 'string' && value ? value : '旧版等级未记录'
+}
 function usage(value: any) {
   if (!value || !Object.values(value).some((v) => typeof v === 'number')) return 'Token 用量未知'
   return value.total_tokens != null
@@ -728,6 +742,10 @@ onBeforeUnmount(() => {
               <div>
                 <dt>使用模型</dt>
                 <dd>{{ cfg?.model || '未配置' }}</dd>
+                <dt>接口 / 思考等级</dt>
+                <dd>
+                  {{ protocolLabel(cfg?.api_format) }} · {{ reasoningLabel(cfg?.reasoning_effort) }}
+                </dd>
               </div>
             </dl>
           </section>
@@ -926,6 +944,13 @@ onBeforeUnmount(() => {
             >
           </p>
           <div class="ai-report-metrics">
+            <span v-if="!report.preview"
+              >{{ protocolLabel(report.api_format) }} · 思考
+              {{ reasoningLabel(report.reasoning_effort)
+              }}<template v-if="report.max_output_tokens">
+                · 输出上限 {{ report.max_output_tokens }} Token</template
+              ></span
+            >
             <span
               >统计商品 <strong>{{ report.snapshot?.total_products ?? '—' }}</strong></span
             ><span
@@ -1205,6 +1230,10 @@ onBeforeUnmount(() => {
                   <td>
                     {{ item.trigger === 'daily' ? '每日定时' : '手动' }}
                     <div class="table-secondary">{{ item.model }}</div>
+                    <div class="table-secondary">
+                      {{ protocolLabel(item.api_format) }} ·
+                      {{ reasoningLabel(item.reasoning_effort) }}
+                    </div>
                   </td>
                   <td>
                     <span class="badge" :class="badge(item.status)">{{ label(item.status) }}</span>

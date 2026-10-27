@@ -10,6 +10,10 @@ def migrate_ai_center(connection):
         'canonical_products': {'mapping_revision': 'INTEGER NOT NULL DEFAULT 0'},
         'ai_suggestions': {'proposed_category_path': "VARCHAR(500) NOT NULL DEFAULT ''"},
     }
+    for table in ('ai_settings','ai_analysis_runs'):
+        columns[table].update(api_format="VARCHAR(32) NOT NULL DEFAULT 'chat_completions'",
+                              reasoning_effort="VARCHAR(16) NOT NULL DEFAULT 'auto'",
+                              max_output_tokens='INTEGER NOT NULL DEFAULT 4000')
     for table, fields in columns.items():
         for name, definition in fields.items():
             connection.execute(text(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {definition}'))

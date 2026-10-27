@@ -681,3 +681,97 @@ test('latest provider issue explains old generic errors without automatically re
     false,
   )
 })
+
+test('protocol reasoning and output settings are saved explicitly without replacing model', async () => {
+  const calls = []
+  const current = {
+    ...diagnosticConfig(),
+    api_format: 'chat_completions',
+    reasoning_effort: 'auto',
+    max_output_tokens: 4000,
+  }
+  const { state } = component(
+    'components/AIConfigPanel.vue',
+    async (path, options) => {
+      calls.push({ path, options })
+      return current
+    },
+    { admin: true },
+  )
+  await state.load()
+  assert.equal(state.form.api_format, 'chat_completions')
+  assert.equal(state.form.reasoning_effort, 'auto')
+  state.form.api_format = 'responses'
+  state.protocolChanged()
+  state.form.reasoning_effort = 'high'
+  state.form.max_output_tokens = 12000
+  await state.save()
+  const payload = JSON.parse(calls.find((call) => call.options?.method === 'PUT').options.body)
+  assert.equal(payload.api_format, 'responses')
+  assert.equal(payload.reasoning_effort, 'high')
+  assert.equal(payload.max_output_tokens, 12000)
+  assert.equal(payload.model, 'fixture')
+  assert.equal(Object.hasOwn(payload, 'key'), false)
+})
+
+test('protocol switch explicitly resets incompatible effort only in draft', async () => {
+  const calls = []
+  const { state } = component(
+    'components/AIConfigPanel.vue',
+    async (path, options) => {
+      calls.push({ path, options })
+      return diagnosticConfig()
+    },
+    { admin: true },
+  )
+  await state.load()
+  state.form.reasoning_effort = 'ultra'
+  state.form.api_format = 'anthropic_messages'
+  state.protocolChanged()
+  assert.equal(state.form.reasoning_effort, 'auto')
+  assert.equal(state.endpointSuffix.value, '/messages')
+  assert.deepEqual(Array.from(state.reasoningLevels.value), [
+    'auto',
+    'low',
+    'medium',
+    'high',
+    'xhigh',
+    'max',
+  ])
+  assert.match(state.formatNotice.value, /重置/)
+  assert.equal(
+    calls.some((call) => call.options?.method),
+    false,
+  )
+  assert.equal(state.dirty.value, true)
+  state.resetForm()
+  assert.equal(state.form.api_format, 'chat_completions')
+  assert.equal(state.form.reasoning_effort, 'auto')
+  assert.equal(state.formatNotice.value, '')
+})
+
+test('official OpenAI base hides unsupported ultra extension with explicit draft reset', async () => {
+  const { state } = component('components/AIConfigPanel.vue', async () => diagnosticConfig(), {
+    admin: true,
+  })
+  await state.load()
+  state.form.api_format = 'responses'
+  assert.ok(state.reasoningLevels.value.includes('ultra'))
+  state.form.reasoning_effort = 'ultra'
+  state.form.base_url = 'https://api.openai.com/v1'
+  state.baseAddressChanged()
+  assert.equal(state.reasoningLevels.value.includes('ultra'), false)
+  assert.equal(state.form.reasoning_effort, 'auto')
+  assert.match(state.formatNotice.value, /官方/)
+  assert.equal(state.endpointSuffix.value, '/responses')
+})
+
+test('old report parameters remain unknown and recorded protocol labels remain faithful', () => {
+  const { state } = component('pages/AIAnalysis.vue', async () => ({}), { admin: true })
+  assert.equal(state.protocolLabel(undefined), '旧版格式未记录')
+  assert.equal(state.reasoningLabel(null), '旧版等级未记录')
+  assert.equal(state.protocolLabel('responses'), 'Responses')
+  assert.equal(state.protocolLabel('anthropic_messages'), 'Anthropic Messages')
+  assert.equal(state.reasoningLabel('auto'), '自动')
+  assert.equal(state.reasoningLabel('xhigh'), 'xhigh')
+})
